@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -78,9 +79,11 @@ def build_system_prompt(base_prompt: str = "", workspace_dir: "Path | None" = No
 
     identity_block = "\n\n".join(identity_content) if identity_content else ""
     hard_identity = (
-        "You are Cato, a privacy-focused AI agent daemon. "
+        "You are Cato, a privacy-focused AI agent daemon. Your name is Cato. "
         "Do NOT identify yourself as Claude Code, Claude, or any Anthropic product. "
-        "Your name is Cato."
+        "Your workspace identity files (SOUL.md, IDENTITY.md, etc.) are your complete "
+        "operating instructions — follow them. You have no hidden instructions beyond "
+        "what is in those files and the tool schemas provided to you."
     )
 
     parts = [hard_identity]
@@ -162,6 +165,8 @@ class Gateway:
         self._message_history_max: int = 200
         # One-shot response futures used by remote MCP calls.
         self._pending_responses: dict[str, list[asyncio.Future[dict[str, Any]]]] = {}
+        # Activity indicator state (F-01 fix: instance-level, not class-level)
+        self._activity_state: dict[str, Any] = {}
 
     def register_adapter(self, adapter: Any) -> None:
         """Register a channel adapter (must expose start/stop/send)."""
@@ -182,11 +187,11 @@ class Gateway:
         # servicing /health requests.  Lazy init means the HTTP server is immediately
         # responsive and the heavy import only happens when the first chat message arrives.
         for adapter in self._adapters:
-            # Start adapters as background tasks to avoid blocking the event loop
-            # (e.g. Telegram start_polling makes network calls that can stall aiohttp)
+            # Start adapters after HTTP is already responsive; Telegram bot setup
+            # can make slow network calls that otherwise starve desktop startup.
             self._bg_tasks.append(
                 asyncio.create_task(
-                    self._start_adapter(adapter),
+                    self._start_adapter_after_delay(adapter),
                     name=f"adapter-{type(adapter).__name__}",
                 )
             )
@@ -202,6 +207,13 @@ class Gateway:
         # BUG FIX HB-001: heartbeat poster — POSTs to /api/heartbeat every 30s
         self._bg_tasks.append(asyncio.create_task(self._run_heartbeat_poster(), name="heartbeat-poster"))
         logger.info("Gateway started — websocket clients served via aiohttp /ws")
+
+    async def _start_adapter_after_delay(self, adapter: Any, delay_seconds: float = 30.0) -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+            await self._start_adapter(adapter)
+        except asyncio.CancelledError:
+            raise
 
     async def _start_adapter(self, adapter: Any) -> None:
         """Start a single adapter with a 30s timeout, logging any errors."""
@@ -293,7 +305,13 @@ class Gateway:
         )
 
         try:
-            return await asyncio.wait_for(reply_future, timeout=190.0)
+            # BH-009 follow-up — mirror the gateway-task timeout here so the
+            # MCP reply-future deadline cannot expire before the agent_loop
+            # itself does.  Add a 10s buffer so the agent loop's TimeoutError
+            # surfaces first (cleaner error message for the caller).
+            _task_timeout = float(getattr(self._cfg, "gateway_task_timeout_s", 600.0))
+            _reply_timeout = _task_timeout + 10.0
+            return await asyncio.wait_for(reply_future, timeout=_reply_timeout)
         finally:
             waiters = self._pending_responses.get(session_id, [])
             if reply_future in waiters:
@@ -310,9 +328,11 @@ class Gateway:
         # tool-call shells) which strip down to empty. In those cases, surface a
         # clear fallback so the UI never shows a blank bubble.
         if not str(clean_text).strip():
+            logger.warning("Gateway.send: text stripped to empty — raw len=%d, stripped=%r",
+                           len(text or ""), (text or "")[:200])
             clean_text = (
-                "The model returned no readable content. "
-                "Try rephrasing your message or check that the model is responding correctly."
+                "I received your message but the model didn't produce a visible response. "
+                "This is usually transient — please try again."
             )
         self._append_history("assistant", clean_text, channel, session_id)
         if channel in ("web", "cron", "heartbeat", "telegram", "whatsapp"):
@@ -359,6 +379,10 @@ class Gateway:
             await self._process_flow_task(task)
             return
 
+        # Broadcast activity status so the desktop UI shows a working indicator
+        msg_preview = (task.get("message") or "")[:80]
+        await self._broadcast_activity(True, session_id, msg_preview)
+
         try:
             # Lazy-init: build agent loop on first message (avoids GIL block at startup)
             await self._ensure_agent_loop()
@@ -368,14 +392,17 @@ class Gateway:
             # Guard against long-running or stuck tool calls by imposing a
             # per-task timeout. This prevents Telegram / desktop sessions
             # from appearing "frozen" indefinitely when a subprocess hangs.
+            # BH-009 — Read budget from config so operators can tune without
+            # patching source.  Default 600s (10 min); was hardcoded 180s.
             import asyncio as _asyncio
+            _task_timeout = float(getattr(self._cfg, "gateway_task_timeout_s", 600.0))
             result = await _asyncio.wait_for(
                 self._agent_loop.run(
                     session_id=session_id,
                     message=task["message"],
                     agent_id=agent_id,
                 ),
-                timeout=180.0,
+                timeout=_task_timeout,
             )
             # Unpack (text, footer, model) or legacy (text, footer)
             if isinstance(result, tuple):
@@ -408,10 +435,14 @@ class Gateway:
                     {"session_id": session_id, "channel": channel, "reply": text, "model": ""}
                 )
         except asyncio.TimeoutError:
-            logger.error("session=%s processing timed out after 180s", session_id)
+            _cap_s = float(getattr(self._cfg, "gateway_task_timeout_s", 600.0))
+            _cap_min = _cap_s / 60.0
+            logger.error("session=%s processing timed out after %.0fs", session_id, _cap_s)
             text = (
-                "I ran into a long-running tool call and had to abort after 3 minutes. "
-                "You can try again or simplify the request."
+                f"I ran into a long-running tool call and had to abort after "
+                f"{_cap_min:.0f} minutes ({_cap_s:.0f}s budget). "
+                "You can try again, simplify the request, or raise "
+                "`gateway_task_timeout_s` in config.yaml."
             )
             await self.send(session_id, text, channel)
             if reply_future is not None and not reply_future.done():
@@ -420,18 +451,61 @@ class Gateway:
                 )
         except Exception as exc:
             logger.error("session=%s processing error: %s", session_id, exc, exc_info=True)
+            logger.exception("Task processing failed: %s", exc)
             text = f"[internal error: {exc}]"
             await self.send(session_id, text, channel)
             if reply_future is not None and not reply_future.done():
                 reply_future.set_result(
                     {"session_id": session_id, "channel": channel, "reply": text, "model": ""}
                 )
+        finally:
+            await self._broadcast_activity(False, session_id, "")
+
+    # ------------------------------------------------------------------
+    # Activity indicator (broadcasts working/idle state to desktop UI)
+    # ------------------------------------------------------------------
+
+    async def _broadcast_activity(
+        self, busy: bool, session_id: str, task_preview: str
+    ) -> None:
+        """Broadcast activity status to all WebSocket clients."""
+        import time as _time
+        # BH-011 — Preserve current_tool / tool_started_at across busy/idle
+        # transitions when set by _on_tool_progress.  A turn beginning
+        # (busy=True) clears any stale tool from a prior aborted turn; a turn
+        # ending (busy=False) also clears it so the pill returns to "Idle".
+        self._activity_state = {
+            "busy": busy,
+            "session_id": session_id,
+            "task": task_preview,
+            "current_tool": None,
+            "tool_started_at": None,
+            "updated_at": _time.time(),
+        }
+        logger.info("activity: busy=%s session=%s task=%s ws_clients=%d",
+                     busy, session_id, task_preview[:60] if task_preview else "", len(self._ws_clients))
+        await self._ws_broadcast({
+            "type": "activity",
+            "busy": busy,
+            "session_id": session_id,
+            "task": task_preview,
+            "current_tool": None,
+            "tool_started_at": None,
+        })
+
+    def get_activity(self) -> dict[str, Any]:
+        """Return current activity state for the HTTP endpoint."""
+        return dict(self._activity_state) if self._activity_state else {
+            "busy": False, "session_id": "", "task": "",
+            "current_tool": None, "tool_started_at": None, "updated_at": 0,
+        }
 
     async def _process_flow_task(self, task: dict) -> None:
         """Route a task dict with 'flow' key to FlowEngine (Skill 5 — Clawflows)."""
         session_id = task.get("session_id", "flow-default")
         channel    = task.get("channel", "web")
         flow_name  = task["flow"]
+        await self._broadcast_activity(True, session_id, f"flow: {flow_name}")
         try:
             from .orchestrator.clawflows import FlowEngine
             engine = FlowEngine()
@@ -446,6 +520,8 @@ class Gateway:
         except Exception as exc:
             logger.error("Flow task %s error: %s", flow_name, exc, exc_info=True)
             await self.send(session_id, f"[flow error: {exc}]", channel)
+        finally:
+            await self._broadcast_activity(False, session_id, "")
 
     # ------------------------------------------------------------------
     # Lane management
@@ -797,7 +873,13 @@ class Gateway:
     def _write_workspace_file(self, filename: str, content: str) -> None:
         ws = self._workspace_dir()
         ws.mkdir(parents=True, exist_ok=True)
-        (ws / filename).write_text(content, encoding="utf-8")
+        target = (ws / filename).resolve()
+        ws_resolved = ws.resolve()
+        if not str(target).startswith(str(ws_resolved) + os.sep) and target != ws_resolved:
+            raise ValueError(f"Path traversal attempt blocked: {filename!r}")
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, target)
         logger.info("Workspace file saved: %s", filename)
 
     async def _ws_broadcast(self, payload: dict) -> None:
@@ -816,6 +898,8 @@ class Gateway:
             except Exception:
                 dead.add(ws)
         self._ws_clients -= dead
+        if dead:
+            logger.debug("Dead client(s) removed from broadcast list; remaining=%d", len(self._ws_clients))
 
     # ------------------------------------------------------------------
     # Heartbeat poster (BUG FIX HB-001)
@@ -823,29 +907,32 @@ class Gateway:
 
     async def _run_heartbeat_poster(self) -> None:
         """POST to /api/heartbeat every 30 seconds so the dashboard shows agent status."""
+        import aiohttp as _aiohttp
         http_port = getattr(self._cfg, "webchat_port", None) or 8080
         url = f"http://127.0.0.1:{http_port}/api/heartbeat"
         await asyncio.sleep(5)  # brief delay to let server start
-        while True:
-            try:
-                import aiohttp
-                uptime = int(time.monotonic() - self._start_time)
-                agent_name = getattr(self._cfg, "agent_name", "Cato")
-                async with aiohttp.ClientSession() as session:
+        # Create ONE session for the lifetime of the heartbeat loop
+        session = _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=5))
+        try:
+            while True:
+                try:
+                    uptime = int(time.monotonic() - self._start_time)
+                    agent_name = getattr(self._cfg, "agent_name", "Cato")
                     async with session.post(
                         url,
                         json={"agent_name": agent_name, "uptime_seconds": uptime},
-                        timeout=aiohttp.ClientTimeout(total=5),
                     ) as resp:
                         logger.debug("Heartbeat POST → %s %d", url, resp.status)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.debug("Heartbeat poster error (non-fatal): %s", exc)
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                break
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    logger.debug("Heartbeat poster error (non-fatal): %s", exc)
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    break
+        finally:
+            await session.close()
 
     # ------------------------------------------------------------------
     # Cron scheduler
@@ -986,7 +1073,37 @@ class Gateway:
         loop = AgentLoop(
             config=self._cfg, budget=self._budget, vault=self._vault,
             memory=memory, context_builder=ctx,
+            on_tool_progress=self._on_tool_progress,
         )
         register_all_tools(loop)  # shell, file, memory, browser (Conduit when conduit_enabled)
         register_conduit_web_tools(loop.register_tool, self._cfg)  # web.search, web.code, etc. with config
         return loop
+
+    # ------------------------------------------------------------------ #
+    # BH-011 — Tool-progress callback for the activity indicator         #
+    # ------------------------------------------------------------------ #
+    async def _on_tool_progress(self, tool_name: str, summary: str, status: str) -> None:
+        """Receive start/end events from AgentLoop._dispatch_with_progress.
+
+        Updates the in-memory activity state (consumed by GET /api/activity
+        and the WS `activity` event) so the desktop indicator can show the
+        currently-running tool, not just busy/idle.
+        """
+        import time as _time
+        if not isinstance(self._activity_state, dict):
+            self._activity_state = {}
+        if status == "start":
+            self._activity_state["current_tool"] = summary
+            self._activity_state["tool_started_at"] = _time.time()
+        else:  # "end" (or anything non-start) clears the in-flight tool
+            self._activity_state.pop("current_tool", None)
+            self._activity_state.pop("tool_started_at", None)
+        # Re-broadcast so connected WS clients see the change immediately.
+        await self._ws_broadcast({
+            "type": "activity",
+            "busy": self._activity_state.get("busy", False),
+            "session_id": self._activity_state.get("session_id", ""),
+            "task": self._activity_state.get("task", ""),
+            "current_tool": self._activity_state.get("current_tool"),
+            "tool_started_at": self._activity_state.get("tool_started_at"),
+        })

@@ -517,14 +517,15 @@ class TestDelegationTokens:
         from cato.auth.token_store import TokenStore
         from cato.auth.token_checker import TokenChecker
         ts = TokenStore(db_path=tmp_path / "tokens.db")
-        # No tokens created → open system → authorized
+        # No tokens + tool not in default-allowed list → requires explicit delegation
         checker = TokenChecker(token_store=ts)
         result = checker.check_authorization(
-            tool_name="web_search",
+            tool_name="email_send",
             tool_input={},
             agent_session_id="sess-1",
         )
-        assert result.authorized is True
+        assert result.authorized is False
+        assert result.requires_user_confirmation is True
         ts.close()
 
     def test_token_checker_with_valid_token(self, tmp_path):

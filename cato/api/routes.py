@@ -21,11 +21,13 @@ def register_all_routes(app: web.Application) -> None:
     from cato.api.memory_routes import register_routes as register_memory
     from cato.api.whatsapp_routes import register_routes as register_whatsapp
     from cato.api.pty_routes import register_routes as register_pty
+    from cato.api.integration_routes import register_routes as register_integrations
 
     register_coding_agent(app)
     register_workspace(app)
     register_logs(app)
     register_memory(app)
     register_whatsapp(app)
+    register_integrations(app)
     register_pty(app)
     logger.info("All API routes registered")

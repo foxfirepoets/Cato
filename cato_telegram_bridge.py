@@ -29,6 +29,14 @@ from typing import Optional
 # ── Cato path ──────────────────────────────────────────────────────────────
 CATO_ROOT = Path(r"C:\Users\Administrator\Desktop\Cato")
 sys.path.insert(0, str(CATO_ROOT))
+ENV_PATH = CATO_ROOT / ".env"
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ENV_PATH, override=False)
+except ImportError:
+    pass
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,10 +45,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("cato_telegram_bridge")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
 
 # ── python-telegram-bot ────────────────────────────────────────────────────
 try:
-    from telegram import Update
+    from telegram import Bot, Update
     from telegram.constants import ChatAction
     from telegram.ext import (
         Application,
@@ -67,8 +77,17 @@ PIPELINE_TAIL_LINES     = 15    # lines of log to send in each progress update
 MAX_TELEGRAM_MSG_LEN    = 4000
 STARTUP_TIME            = time.monotonic()
 
-# ── Bot token (claudeoneshot_bot — never Cato's own bot) ───────────────────
-BRIDGE_BOT_TOKEN = "8573304576:AAFT4SbfetSd2ydONWYE75atJC-CHmjLu9U"
+# ── Bot configuration ──────────────────────────────────────────────────────
+BRIDGE_BOT_TOKEN_ENV_KEYS = (
+    "CATODESKTOP_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "CATO_TELEGRAM_BOT_TOKEN",
+)
+BRIDGE_BOT_USERNAME_ENV_KEYS = (
+    "CATODESKTOP_BOT_USERNAME",
+    "TELEGRAM_BOT_USERNAME",
+    "CATO_TELEGRAM_BOT_USERNAME",
+)
 
 # CWD for claude calls — loads CLAUDE.md + MEMORY.md
 CLAUDE_CWD = r"C:\Users\Administrator\Desktop\Cato"
@@ -98,16 +117,82 @@ _chat_workers:  dict[int, asyncio.Task]  = {}
 _bg_pipelines:  dict[int, dict]          = {}   # chat_id -> {proc, log_path, task}
 
 
+# ── Access control ─────────────────────────────────────────────────────────
+def _allowed_chat_ids_from_env() -> set[int]:
+    raw = os.environ.get("TELEGRAM_CHAT_ID", "")
+    ids: set[int] = set()
+    for value in re.split(r"[,;\s]+", raw):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            ids.add(int(value))
+        except ValueError:
+            logger.warning("Ignoring invalid TELEGRAM_CHAT_ID value: %r", value)
+    return ids or {5846582379}
+
+
+# Telegram chat IDs allowed to drive this bridge. Chat IDs are identifiers,
+# not secrets. Prefer .env so the bridge follows the currently configured user.
+ALLOWED_CHAT_IDS: set[int] = _allowed_chat_ids_from_env()
+
+
+def _is_authorized(update: Update) -> bool:
+    """Return True if the update originates from an allowlisted chat."""
+    chat = update.effective_chat if update else None
+    return chat is not None and chat.id in ALLOWED_CHAT_IDS
+
+
+async def _reject_unauthorized(update: Update) -> bool:
+    """
+    Gate inbound Telegram updates against ALLOWED_CHAT_IDS.
+
+    Returns True if the update was rejected (caller must return immediately).
+    Returns False if the update is authorized and processing should continue.
+    """
+    if _is_authorized(update):
+        return False
+    chat = update.effective_chat if update else None
+    user = update.effective_user if update else None
+    chat_id  = chat.id if chat else None
+    username = (user.username if user else None) or "(no username)"
+    name = ""
+    if user:
+        name = ((user.first_name or "") + " " + (user.last_name or "")).strip()
+    logger.warning(
+        "Rejected unauthorized update: chat_id=%s username=%s name=%s",
+        chat_id, username, name,
+    )
+    try:
+        if update and update.message:
+            await update.message.reply_text("Unauthorized.")
+    except Exception:
+        pass
+    return True
+
+
 # ── Env + CLI helpers ──────────────────────────────────────────────────────
 
 def _resolve_token() -> str:
     override = os.environ.get("CLAUDE_BRIDGE_TOKEN", "").strip()
     if override:
         return override
-    if BRIDGE_BOT_TOKEN:
-        logger.info("Using hardcoded claudeoneshot_bot token.")
-        return BRIDGE_BOT_TOKEN
-    raise RuntimeError("No bridge bot token configured.")
+    for key in BRIDGE_BOT_TOKEN_ENV_KEYS:
+        token = os.environ.get(key, "").strip()
+        if token:
+            logger.info("Using Telegram bridge bot token from %s.", key)
+            return token
+    raise RuntimeError(
+        "No bridge bot token configured. Set CATODESKTOP_BOT_TOKEN or TELEGRAM_BOT_TOKEN in .env."
+    )
+
+
+def _resolve_configured_username() -> str:
+    for key in BRIDGE_BOT_USERNAME_ENV_KEYS:
+        username = os.environ.get(key, "").strip().lstrip("@")
+        if username:
+            return username
+    return ""
 
 
 def _build_env() -> dict[str, str]:
@@ -118,7 +203,17 @@ def _build_env() -> dict[str, str]:
 
 
 def _find_claude() -> Optional[str]:
-    return shutil.which("claude")
+    # Try PATH first, then fall back to known install locations
+    found = shutil.which("claude")
+    if found:
+        return found
+    for candidate in [
+        r"C:\Users\Administrator\.local\bin\claude.exe",
+        r"C:\Users\Administrator\.local\bin\claude",
+    ]:
+        if Path(candidate).exists():
+            return candidate
+    return None
 
 
 def _split_message(text: str, limit: int = MAX_TELEGRAM_MSG_LEN) -> list[str]:
@@ -149,6 +244,25 @@ async def _bot_send(bot, chat_id: int, text: str) -> None:
             logger.warning("Failed to send message to %s: %s", chat_id, e)
 
 
+async def _log_bot_identity(token: str) -> None:
+    """Verify the configured token and compare it to the optional username."""
+    bot = Bot(token=token)
+    me = await bot.get_me()
+    actual_username = (me.username or "").lstrip("@")
+    configured_username = _resolve_configured_username()
+    if configured_username and actual_username.lower() != configured_username.lower():
+        raise RuntimeError(
+            "Configured Telegram bot username does not match token: "
+            f".env has @{configured_username}, Telegram returned @{actual_username or 'unknown'}."
+        )
+    logger.info(
+        "Telegram bridge bot verified: id=%s username=@%s allowed_chats=%s",
+        me.id,
+        actual_username or "unknown",
+        sorted(ALLOWED_CHAT_IDS),
+    )
+
+
 # ── TIER 1: Simple conversational reply ────────────────────────────────────
 
 async def _run_claude_simple(message: str, update: Update) -> str:
@@ -166,6 +280,8 @@ async def _run_claude_simple(message: str, update: Update) -> str:
 
     proc = await asyncio.create_subprocess_exec(
         claude_path, "-p", message, "--output-format", "text",
+        "--dangerously-skip-permissions",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
@@ -248,7 +364,9 @@ async def _run_pipeline_background(
 
     try:
         proc = subprocess.Popen(
-            [claude_path, "-p", message, "--output-format", "text"],
+            [claude_path, "-p", message, "--output-format", "text",
+             "--dangerously-skip-permissions"],
+            stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=log_handle,
             env=env,
@@ -378,20 +496,24 @@ async def _chat_worker(chat_id: int) -> None:
 # ── Command handlers ───────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_unauthorized(update):
+        return
     await update.message.reply_text(
-        "👋 Claude Code bridge — claudeoneshot_bot\n\n"
+        "Cato Telegram bridge is online.\n\n"
         "Commands:\n"
         "  /build <task> — run as background job (for pipelines, builds, Codex hand-offs)\n"
         "  /stop — cancel running background job\n"
         "  /status — bridge status\n"
         "  /help — this message\n\n"
-        "Or just type any message for a quick Claude reply.\n\n"
-        "💡 Tip: Complex multi-step tasks (build a site, run pipeline, hand to Codex) "
+        "Or just type any message for a quick Cato reply.\n\n"
+        "Tip: Complex multi-step tasks (build a site, run pipeline, hand to Codex) "
         "work best with /build — they run in the background with live progress updates."
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_unauthorized(update):
+        return
     await update.message.reply_text(
         "📖 How to use this bridge:\n\n"
         "QUICK QUESTIONS (type directly):\n"
@@ -410,6 +532,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_unauthorized(update):
+        return
     uptime_s = int(time.monotonic() - STARTUP_TIME)
     h, rem = divmod(uptime_s, 3600)
     m, s = divmod(rem, 60)
@@ -435,6 +559,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/build <task> — always Tier 2 background job."""
+    if await _reject_unauthorized(update):
+        return
     if not context.args:
         await update.message.reply_text(
             "Usage: /build <what you want Claude to do>\n\n"
@@ -448,6 +574,8 @@ async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/pipeline <idea> — background pipeline job."""
+    if await _reject_unauthorized(update):
+        return
     if not context.args:
         await update.message.reply_text("Usage: /pipeline <your business idea>")
         return
@@ -457,6 +585,8 @@ async def cmd_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_unauthorized(update):
+        return
     chat_id = update.effective_chat.id
     bg = _bg_pipelines.get(chat_id)
     if bg:
@@ -481,6 +611,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
       - Pipeline-like requests → Tier 2 background job (with user confirmation)
       - Everything else → Tier 1 claude -p queue
     """
+    if await _reject_unauthorized(update):
+        return
     user_text = (update.message.text or "").strip()
     if not user_text:
         return
@@ -530,6 +662,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     token = _resolve_token()
+    asyncio.run(_log_bot_identity(token))
     logger.info("Building Telegram Application...")
 
     app = Application.builder().token(token).build()

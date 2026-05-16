@@ -17,6 +17,37 @@ interface MemorySettings {
   model: string
 }
 
+interface IntegrationMetadata {
+  vault_keys_present?: string[]
+  env_keys_present?: string[]
+  required_vault_keys?: string[]
+  config?: Record<string, unknown>
+}
+
+interface IntegrationStatus {
+  id: string
+  name: string
+  category: string
+  description: string
+  enabled: boolean
+  configured: boolean
+  connected: boolean
+  connection_source?: string
+  status: string
+  metadata?: IntegrationMetadata
+}
+
+interface IntegrationsResponse {
+  live_checks_performed: boolean
+  secrets_returned: boolean
+  vault_status: string
+  config_guidance?: {
+    restart_required: boolean
+    message: string
+  }
+  integrations: IntegrationStatus[]
+}
+
 interface SettingsViewProps {
   httpPort: number
 }
@@ -30,6 +61,7 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
 
   // State for each tab
   const [whatsappConfig, setWhatsappConfig] = useState<WhatsAppConfig | null>(null)
+  const [integrations, setIntegrations] = useState<IntegrationsResponse | null>(null)
   const [memoryStats, setMemoryStats] = useState<MemorySettings | null>(null)
   const [workspacePath, setWorkspacePath] = useState('')
   const [defaultModel, setDefaultModel] = useState('')
@@ -61,10 +93,17 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
           break
 
         case 'channels':
-          const whatsRes = await fetch(`${base}/api/whatsapp/config`)
+          const [whatsRes, integrationsRes] = await Promise.all([
+            fetch(`${base}/api/whatsapp/config`),
+            fetch(`${base}/api/integrations/status`),
+          ])
           if (whatsRes.ok) {
             const data = await whatsRes.json()
             setWhatsappConfig(data)
+          }
+          if (integrationsRes.ok) {
+            const data = await integrationsRes.json()
+            setIntegrations(data)
           }
           break
 
@@ -202,6 +241,37 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
           {activeTab === 'channels' && (
             <div className="tab-pane">
               <h2>Channel Configuration</h2>
+              {integrations && (
+                <div className="channel-section">
+                  <h3>Integration Status</h3>
+                  <p className="hint">
+                    {integrations.config_guidance?.message}
+                  </p>
+                  {integrations.integrations.map(integration => (
+                    <div key={integration.id} className="setting-group">
+                      <p>
+                        <strong>{integration.name}:</strong>{' '}
+                        <span className={integration.connected ? 'status-active' : 'status-inactive'}>
+                          {integration.connected ? 'Connected' : integration.configured ? 'Configured' : 'Not Configured'}
+                        </span>
+                      </p>
+                      <p className="hint">{integration.description}</p>
+                      <p>
+                        <strong>Credentials:</strong>{' '}
+                        {(integration.metadata?.vault_keys_present?.length || integration.metadata?.env_keys_present?.length)
+                          ? [
+                              ...(integration.metadata?.vault_keys_present || []).map(key => `vault:${key}`),
+                              ...(integration.metadata?.env_keys_present || []).map(key => `env:${key}`),
+                            ].join(', ')
+                          : `Add ${integration.metadata?.required_vault_keys?.join(' or ') || 'required credentials'} in vault/env`}
+                      </p>
+                    </div>
+                  ))}
+                  <p className="hint">
+                    Live checks: {integrations.live_checks_performed ? 'on' : 'off'} · Secrets returned: {integrations.secrets_returned ? 'yes' : 'no'} · Vault: {integrations.vault_status}
+                  </p>
+                </div>
+              )}
               <div className="channel-section">
                 <h3>WhatsApp</h3>
                 {whatsappConfig ? (

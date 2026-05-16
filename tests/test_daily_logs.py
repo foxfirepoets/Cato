@@ -29,10 +29,13 @@ class TestDailyLogCreation:
 
     def test_get_todays_log_path_returns_path(self):
         """Test get_todays_log_path returns valid Path object."""
-        path = get_todays_log_path()
-        assert isinstance(path, Path)
-        # Should be in workspace directory
-        assert ".cato" in str(path) or "workspace" in str(path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_workspace = Path(tmpdir) / "workspace"
+            with patch("cato.core.daily_log_manager._workspace_dir", return_value=test_workspace):
+                path = get_todays_log_path()
+                assert isinstance(path, Path)
+                assert path.parent == test_workspace
+                assert path.suffix == ".md"
 
     def test_create_daily_log_creates_file(self):
         """Test create_daily_log creates a file if missing."""

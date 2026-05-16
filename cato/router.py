@@ -4,6 +4,9 @@ cato/router.py — SwarmSync-aware model router for CATO.
 Routes tasks to the optimal LLM based on complexity scoring.
 When SwarmSync API key is present, delegates to the SwarmSync API.
 Supports Anthropic, OpenAI-compatible, and Google streaming APIs.
+
+Includes error classification and fallback model rotation inspired by
+Hermes agent's error_classifier.py for resilient LLM call handling.
 """
 
 from __future__ import annotations
@@ -11,11 +14,127 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, AsyncIterator, Optional, Tuple
 
 import aiohttp
 
+
+# ---------------------------------------------------------------------------
+# Error classification (inspired by Hermes agent/error_classifier.py)
+# ---------------------------------------------------------------------------
+
+class FailoverReason(Enum):
+    AUTH = "auth"
+    BILLING = "billing"
+    RATE_LIMIT = "rate_limit"
+    OVERLOADED = "overloaded"
+    SERVER_ERROR = "server_error"
+    TIMEOUT = "timeout"
+    CONTEXT_OVERFLOW = "context_overflow"
+    MODEL_NOT_FOUND = "model_not_found"
+    FORMAT_ERROR = "format_error"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ClassifiedError:
+    reason: FailoverReason
+    status_code: int
+    message: str
+    retryable: bool = True
+    should_fallback: bool = False
+    should_compress: bool = False
+
+
+def classify_api_error(exc: Exception) -> ClassifiedError:
+    """Classify an API error into a recovery-actionable category."""
+    status = 0
+    msg = str(exc).lower()
+
+    # Extract status code from aiohttp or generic exceptions
+    if hasattr(exc, "status"):
+        status = getattr(exc, "status", 0)
+    elif hasattr(exc, "response"):
+        resp = getattr(exc, "response", None)
+        if resp and hasattr(resp, "status"):
+            status = resp.status
+
+    # Status-code based classification
+    if status == 401 or status == 403:
+        return ClassifiedError(FailoverReason.AUTH, status, str(exc),
+                               retryable=False, should_fallback=True)
+    if status == 402:
+        if "rate" in msg or "limit" in msg or "try again" in msg:
+            return ClassifiedError(FailoverReason.RATE_LIMIT, status, str(exc),
+                                   retryable=True, should_fallback=True)
+        return ClassifiedError(FailoverReason.BILLING, status, str(exc),
+                               retryable=False, should_fallback=True)
+    if status == 404:
+        return ClassifiedError(FailoverReason.MODEL_NOT_FOUND, status, str(exc),
+                               retryable=False, should_fallback=True)
+    if status == 413 or "too large" in msg or "context" in msg and "length" in msg:
+        return ClassifiedError(FailoverReason.CONTEXT_OVERFLOW, status, str(exc),
+                               retryable=False, should_compress=True)
+    if status == 429:
+        return ClassifiedError(FailoverReason.RATE_LIMIT, status, str(exc),
+                               retryable=True, should_fallback=True)
+    if status == 400:
+        if "context" in msg or "token" in msg and "max" in msg:
+            return ClassifiedError(FailoverReason.CONTEXT_OVERFLOW, status, str(exc),
+                                   retryable=False, should_compress=True)
+        return ClassifiedError(FailoverReason.FORMAT_ERROR, status, str(exc),
+                               retryable=False)
+    if 500 <= status < 600:
+        return ClassifiedError(FailoverReason.SERVER_ERROR, status, str(exc),
+                               retryable=True, should_fallback=True)
+
+    # Message-pattern based classification
+    if "timeout" in msg or "timed out" in msg:
+        return ClassifiedError(FailoverReason.TIMEOUT, status, str(exc),
+                               retryable=True, should_fallback=True)
+    if "rate" in msg and "limit" in msg:
+        return ClassifiedError(FailoverReason.RATE_LIMIT, status, str(exc),
+                               retryable=True, should_fallback=True)
+    if "overloaded" in msg or "capacity" in msg:
+        return ClassifiedError(FailoverReason.OVERLOADED, status, str(exc),
+                               retryable=True, should_fallback=True)
+    if "unauthorized" in msg or "authentication" in msg:
+        return ClassifiedError(FailoverReason.AUTH, status, str(exc),
+                               retryable=False, should_fallback=True)
+
+    return ClassifiedError(FailoverReason.UNKNOWN, status, str(exc), retryable=True)
+
+
+# Fallback chain: if primary model fails, try these in order
+_FALLBACK_CHAIN: list[str] = [
+    "claude-sonnet-4-6",
+    "gpt-4o",
+    "gemini-2.0-flash",
+    "deepseek-chat",
+    "llama-3.3-70b-versatile",
+]
+
 logger = logging.getLogger(__name__)
+
+_LOG_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)(bot)\d+:[A-Za-z0-9_-]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)\S+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b([A-Z][A-Z0-9_]{2,}_(?:TOKEN|KEY|SECRET|PASSWORD|PASS)\s*=\s*)\S+"), r"\1[REDACTED]"),
+    (re.compile(r"\b(sk-[A-Za-z0-9_-]{16,})\b"), "[REDACTED-KEY]"),
+)
+
+
+def _scrub_log_text(text: str) -> str:
+    if not text:
+        return text
+    for pattern, replacement in _LOG_SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+RouterStreamChunk = str | dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # Model translation: OpenRouter slugs → native IDs
@@ -83,6 +202,16 @@ _RE_CODE     = re.compile(r"(```|def |class |import |#include|function\s+\w+)", 
 _RE_NONENGL  = re.compile(r"[^\x00-\x7F]")
 
 
+# Module-level routing history (ring buffer, max 200 entries)
+_routing_history: list[dict] = []
+_ROUTING_HISTORY_MAX = 200
+
+
+def get_routing_history() -> list[dict]:
+    """Return the routing decision history buffer."""
+    return list(_routing_history)
+
+
 class ModelRouter:
     """Routes tasks to optimal model via local scoring or SwarmSync API."""
 
@@ -92,6 +221,7 @@ class ModelRouter:
         preferred_model: str = "claude-sonnet-4-6",
         blocked_models: Optional[list[str]] = None,
         swarmsync_api_url: str = "https://api.swarmsync.ai/v1/chat/completions",
+        max_output_tokens: int = 16384,
     ) -> None:
         self._vault = vault
         # Keep openrouter/ prefixed models untranslated so they route through
@@ -103,6 +233,34 @@ class ModelRouter:
             self._preferred = MODEL_TRANSLATIONS.get(preferred_model, preferred_model)
         self._blocked: set[str] = set(blocked_models or [])
         self._swarmsync_url = swarmsync_api_url
+        self._max_output_tokens = max_output_tokens
+
+        # Circuit breaker state (T12) — open after 3 consecutive failures for 60s
+        self._cb_failures: int = 0
+        self._cb_open_until: float = 0.0
+        self._CB_THRESHOLD = 3
+        self._CB_COOLDOWN = 60.0
+
+        # Shared HTTP session — lazily created and reused across LLM calls
+        self._session: aiohttp.ClientSession | None = None
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Return a cached ClientSession, creating one if needed."""
+        if self._session is None or self._session.closed:
+            import socket
+            resolver = aiohttp.ThreadedResolver()
+            connector = aiohttp.TCPConnector(family=socket.AF_INET, resolver=resolver)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=120),
+            )
+        return self._session
+
+    async def close(self) -> None:
+        """Close the cached HTTP session."""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     def score_task(self, message: str, context_tokens: int, history_len: int) -> float:
         """Return 0.0-1.0 complexity score from message signals."""
@@ -165,7 +323,21 @@ class ModelRouter:
         Returns ``(select_model(score), "")`` on any error so callers can fall
         back gracefully.
         """
-        payload = {
+        model, message = await self._swarmsync_complete_message(messages, api_key, score)
+        return model, message.get("content", "") or ""
+
+    async def _swarmsync_complete_message(
+        self, messages: list[dict], api_key: str, score: float,
+        tools: Optional[list[dict]] = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """
+        Call SwarmSync and return ``(routed_model, assistant_message)``.
+
+        Unlike ``_swarmsync_complete``, this preserves structured OpenAI-style
+        ``tool_calls`` returned by SwarmSync so the agent loop can continue the
+        conversation with real tool messages.
+        """
+        payload: dict[str, Any] = {
             "model": "auto",
             "messages": messages,
             "stream": False,
@@ -174,14 +346,28 @@ class ModelRouter:
                 "history_length": len(messages),
             },
         }
+        if tools:
+            payload["tools"] = tools
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        # Circuit breaker check (T12)
+        import time as _time
+        if self._cb_failures >= self._CB_THRESHOLD:
+            if _time.monotonic() < self._cb_open_until:
+                logger.warning("SwarmSync circuit open — using local selection")
+                return self.select_model(score), {"role": "assistant", "content": ""}
+            else:
+                # Half-open: allow one probe
+                self._cb_failures = 0
+
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
+            import aiohttp as _aiohttp
+            _per_call_timeout = _aiohttp.ClientTimeout(total=45)
+            s = self._get_session()
+            async with s.post(
                     self._swarmsync_url,
                     json=payload,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=120),
+                    timeout=_per_call_timeout,
                 ) as r:
                     # SwarmSync returns 200 or 201 depending on version
                     if r.status in (200, 201):
@@ -195,18 +381,47 @@ class ModelRouter:
                         if raw_model and raw_model != "auto":
                             model = self._resolve_swarmsync_model(raw_model, score)
                             logger.info("SwarmSync routed to: %s (raw: %s)", model, raw_model)
+                        _routing_history.append({
+                            "ts": time.time(),
+                            "routed_model": model,
+                            "raw_model": raw_model,
+                            "complexity": score,
+                            "has_tools": bool(tools),
+                            "msg_count": len(messages),
+                        })
+                        if len(_routing_history) > _ROUTING_HISTORY_MAX:
+                            del _routing_history[:-_ROUTING_HISTORY_MAX]
                         # Extract completion text from choices
-                        text = ""
+                        message: dict[str, Any] = {"role": "assistant", "content": ""}
                         choices = data.get("choices", [])
                         if choices:
-                            text = choices[0].get("message", {}).get("content", "") or ""
-                        return model, text
+                            raw_message = choices[0].get("message", {}) or {}
+                            if isinstance(raw_message, dict):
+                                message = {
+                                    "role": raw_message.get("role", "assistant"),
+                                    "content": raw_message.get("content", "") or "",
+                                }
+                                if raw_message.get("tool_calls"):
+                                    message["tool_calls"] = raw_message["tool_calls"]
+                                if raw_message.get("function_call"):
+                                    message["function_call"] = raw_message["function_call"]
+                        self._cb_failures = 0  # success — reset circuit
+                        logger.info("SwarmSync raw content repr: %r", _scrub_log_text(message.get("content", "")[:300]))
+                        return model, message
                     else:
                         body = await r.text()
                         logger.warning("SwarmSync HTTP %d: %s", r.status, body[:200])
+                        self._cb_failures += 1
+                        if self._cb_failures >= self._CB_THRESHOLD:
+                            self._cb_open_until = _time.monotonic() + self._CB_COOLDOWN
+                            logger.warning("SwarmSync circuit opened for %.0fs", self._CB_COOLDOWN)
         except Exception as exc:
             logger.warning("SwarmSync completion failed: %s — using local selection", exc)
-        return self.select_model(score), ""
+            self._cb_failures += 1
+            if self._cb_failures >= self._CB_THRESHOLD:
+                self._cb_open_until = _time.monotonic() + self._CB_COOLDOWN
+                logger.warning("SwarmSync circuit opened for %.0fs", self._CB_COOLDOWN)
+        return self.select_model(score), {"role": "assistant", "content": ""}
 
     def _resolve_swarmsync_model(self, raw_model: str, score: float) -> str:
         """
@@ -231,7 +446,10 @@ class ModelRouter:
             return raw_model
 
         # 3. Route through OpenRouter if we have a key
-        openrouter_key = self._vault.get("OPENROUTER_API_KEY")
+        try:
+            openrouter_key = self._vault.get("OPENROUTER_API_KEY") if self._vault else ""
+        except Exception:
+            openrouter_key = ""
         if openrouter_key:
             # Avoid double-prefix: openrouter/openrouter/... is invalid
             clean = raw_model.removeprefix("openrouter/")
@@ -251,8 +469,58 @@ class ModelRouter:
         model: str,
         tools: Optional[list[dict]] = None,
         stream: bool = True,
-    ) -> AsyncIterator[str]:
-        """Stream completions from the provider matched to *model*."""
+    ) -> AsyncIterator[RouterStreamChunk]:
+        """Stream completions from the provider matched to *model*.
+
+        On transient failures, classifies the error and attempts fallback
+        models from _FALLBACK_CHAIN before giving up.
+        """
+        models_to_try = [model] + [
+            m for m in _FALLBACK_CHAIN
+            if m != model and self._is_available(m)
+        ]
+        last_error: Optional[Exception] = None
+
+        for attempt_model in models_to_try:
+            try:
+                async for chunk in self._complete_single(attempt_model, messages, tools):
+                    yield chunk
+                # Success — reset circuit breaker
+                self._cb_failures = 0
+                return
+            except Exception as exc:
+                classified = classify_api_error(exc)
+                logger.warning(
+                    "LLM call to %s failed: %s (reason=%s, retryable=%s, should_fallback=%s)",
+                    attempt_model, exc, classified.reason.value,
+                    classified.retryable, classified.should_fallback,
+                )
+                last_error = exc
+
+                # Circuit breaker bookkeeping
+                self._cb_failures += 1
+                if self._cb_failures >= self._CB_THRESHOLD:
+                    self._cb_open_until = time.monotonic() + self._CB_COOLDOWN
+
+                if not classified.should_fallback:
+                    # Non-recoverable errors (format, context overflow) — don't
+                    # try other models, they'll hit the same issue.
+                    raise
+
+                # Otherwise loop to next fallback model
+                continue
+
+        # All models exhausted
+        if last_error:
+            raise last_error
+
+    async def _complete_single(
+        self,
+        model: str,
+        messages: list[dict],
+        tools: Optional[list[dict]] = None,
+    ) -> AsyncIterator[RouterStreamChunk]:
+        """Dispatch a single completion to the appropriate provider."""
         base_url, auth = self._resolve_provider(model)
         api_key = self._get_api_key(auth, model)
         if auth == "x-api-key":
@@ -270,74 +538,172 @@ class ModelRouter:
     # ------------------------------------------------------------------
 
     async def _anthropic(self, messages: list[dict], model: str,
-                          tools: list[dict], api_key: str) -> AsyncIterator[str]:
+                          tools: list[dict], api_key: str) -> AsyncIterator[RouterStreamChunk]:
         system = next((m["content"] for m in messages if m["role"] == "system"), "")
-        user_msgs = [m for m in messages if m["role"] != "system"]
-        payload: dict[str, Any] = {"model": model, "max_tokens": 4096,
+        user_msgs: list[dict[str, Any]] = []
+        for m in messages:
+            role = m.get("role")
+            if role == "system":
+                continue
+            if role == "tool":
+                # Anthropic native tool_result format — uses content blocks, not
+                # plain text stuffed into user messages.  This enables structured
+                # tool calling with Claude models.
+                user_msgs.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m.get("tool_call_id", "unknown"),
+                        "content": m.get("content", ""),
+                    }],
+                })
+            elif role == "assistant":
+                # If the assistant message had tool_calls, convert them to
+                # Anthropic's tool_use content blocks so the conversation
+                # round-trips correctly.
+                tool_calls = m.get("tool_calls") or []
+                if tool_calls:
+                    blocks: list[dict] = []
+                    if m.get("content"):
+                        blocks.append({"type": "text", "text": m["content"]})
+                    for tc in tool_calls:
+                        fn = tc.get("function", tc) if isinstance(tc, dict) else tc
+                        fn_name = fn.get("name", "") if isinstance(fn, dict) else ""
+                        fn_args = fn.get("arguments", "{}") if isinstance(fn, dict) else "{}"
+                        try:
+                            parsed_args = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
+                        except json.JSONDecodeError:
+                            parsed_args = {}
+                        blocks.append({
+                            "type": "tool_use",
+                            "id": tc.get("id", "unknown") if isinstance(tc, dict) else "unknown",
+                            "name": fn_name,
+                            "input": parsed_args,
+                        })
+                    user_msgs.append({"role": "assistant", "content": blocks})
+                else:
+                    user_msgs.append(m)
+            else:
+                user_msgs.append(m)
+
+        # Convert OpenAI-format tool schemas to Anthropic format
+        anthropic_tools: list[dict] = []
+        for t in tools:
+            fn = t.get("function", {})
+            anthropic_tools.append({
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+
+        payload: dict[str, Any] = {"model": model, "max_tokens": self._max_output_tokens,
                                    "messages": user_msgs, "stream": True}
         if system:
             payload["system"] = system
-        if tools:
-            payload["tools"] = tools
+        if anthropic_tools:
+            payload["tools"] = anthropic_tools
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
                    "content-type": "application/json"}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
-            async with s.post("https://api.anthropic.com/v1/messages",
-                              json=payload, headers=headers) as r:
-                r.raise_for_status()
-                async for line in r.content:
-                    decoded = line.decode("utf-8").strip()
-                    if not decoded.startswith("data: "):
-                        continue
-                    raw = decoded[6:]
-                    if raw == "[DONE]":
-                        break
-                    try:
-                        d = json.loads(raw).get("delta", {})
-                        if d.get("type") == "text_delta":
-                            yield d.get("text", "")
-                    except json.JSONDecodeError:
-                        pass
+        s = self._get_session()
+        async with s.post("https://api.anthropic.com/v1/messages",
+                          json=payload, headers=headers) as r:
+            r.raise_for_status()
+            # Track tool_use blocks from the stream
+            current_tool_use: dict[str, Any] | None = None
+            tool_calls_collected: list[dict] = []
+            async for line in r.content:
+                decoded = line.decode("utf-8").strip()
+                if not decoded.startswith("data: "):
+                    continue
+                raw_data = decoded[6:]
+                if raw_data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(raw_data)
+                    evt_type = event.get("type", "")
+
+                    if evt_type == "content_block_start":
+                        block = event.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            current_tool_use = {
+                                "id": block.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": "",
+                                },
+                            }
+                        elif block.get("type") == "text":
+                            pass  # text block start, content comes in deltas
+
+                    elif evt_type == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            yield delta.get("text", "")
+                        elif delta.get("type") == "input_json_delta" and current_tool_use:
+                            current_tool_use["function"]["arguments"] += delta.get("partial_json", "")
+
+                    elif evt_type == "content_block_stop":
+                        if current_tool_use:
+                            tool_calls_collected.append(current_tool_use)
+                            current_tool_use = None
+
+                except json.JSONDecodeError:
+                    pass
+
+            # Yield collected tool calls at the end (same format as OpenAI compat)
+            if tool_calls_collected:
+                yield {"type": "tool_calls", "tool_calls": tool_calls_collected}
 
     async def _openai_compat(self, messages: list[dict], model: str, tools: list[dict],
-                              api_key: str, base_url: str) -> AsyncIterator[str]:
+                              api_key: str, base_url: str) -> AsyncIterator[RouterStreamChunk]:
         # OpenRouter expects "provider/model" not "openrouter/provider/model"
         api_model = model.removeprefix("openrouter/") if model.startswith("openrouter/") else model
         payload: dict[str, Any] = {"model": api_model, "messages": messages, "stream": True}
         if tools:
             payload["tools"] = tools
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
-            async with s.post(base_url, json=payload, headers=headers) as r:
-                r.raise_for_status()
-                async for line in r.content:
-                    decoded = line.decode("utf-8").strip()
-                    if not decoded.startswith("data: "):
-                        continue
-                    raw = decoded[6:]
-                    if raw == "[DONE]":
-                        break
-                    try:
-                        choice = json.loads(raw)["choices"][0]
-                        delta = choice.get("delta", {})
-                        finish = choice.get("finish_reason")
-                        content = delta.get("content")
-                        if content and not _is_model_slug_only(content):
-                            yield content
-                        elif finish == "tool_calls" and not content:
-                            # Model responded with a tool-call frame but no prose
-                            # (e.g. MiniMax M2.5 hallucinates function calls).
-                            # Surface the tool name as a text hint so the response
-                            # is never silently empty.
-                            tool_calls = delta.get("tool_calls") or []
-                            if tool_calls:
-                                names = ", ".join(
-                                    tc.get("function", {}).get("name", "unknown")
-                                    for tc in tool_calls
-                                )
-                                yield f"[attempted tool call: {names} — please rephrase your request]"
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        pass
+        s = self._get_session()
+        async with s.post(base_url, json=payload, headers=headers) as r:
+            r.raise_for_status()
+            tool_call_parts: dict[int, dict[str, Any]] = {}
+            async for line in r.content:
+                decoded = line.decode("utf-8").strip()
+                if not decoded.startswith("data: "):
+                    continue
+                raw = decoded[6:]
+                if raw == "[DONE]":
+                    break
+                try:
+                    choice = json.loads(raw)["choices"][0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content")
+                    if content and not _is_model_slug_only(content):
+                        yield content
+                    for tc in delta.get("tool_calls") or []:
+                        idx = int(tc.get("index", 0))
+                        part = tool_call_parts.setdefault(
+                            idx,
+                            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                        )
+                        if tc.get("id"):
+                            part["id"] = tc["id"]
+                        if tc.get("type"):
+                            part["type"] = tc["type"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            part["function"]["name"] += fn["name"]
+                        if "arguments" in fn:
+                            part["function"]["arguments"] += fn.get("arguments") or ""
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    pass
+            if tool_call_parts:
+                yield {
+                    "type": "tool_calls",
+                    "tool_calls": [
+                        tool_call_parts[idx] for idx in sorted(tool_call_parts)
+                    ],
+                }
 
     async def _google(self, messages: list[dict], model: str,
                        api_key: str) -> AsyncIterator[str]:
@@ -347,26 +713,35 @@ class ModelRouter:
             if m["role"] == "system":
                 sys_parts.append({"text": m["content"]})
                 continue
-            role = "model" if m["role"] == "assistant" else "user"
-            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+            # Map tool role back to user for Gemini (no native tool result role)
+            role_map = {"assistant": "model", "user": "user", "tool": "user"}
+            role = role_map.get(m.get("role", "user"), "user")
+            text = m.get("content") or m.get("result", "")
+            if isinstance(text, str) and text:
+                contents.append({"role": role, "parts": [{"text": text}]})
         payload: dict[str, Any] = {"contents": contents}
         if sys_parts:
             payload["system_instruction"] = {"parts": sys_parts}
+        # Use ?alt=sse for true SSE streaming instead of buffered JSON array
         url = (f"https://generativelanguage.googleapis.com/v1beta/models"
-               f"/{model}:streamGenerateContent")
+               f"/{model}:streamGenerateContent?alt=sse")
         headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
-            async with s.post(url, json=payload, headers=headers) as r:
-                r.raise_for_status()
+        s = self._get_session()
+        async with s.post(url, json=payload, headers=headers) as r:
+            r.raise_for_status()
+            async for line in r.content:
+                decoded = line.decode("utf-8").strip()
+                if not decoded.startswith("data: "):
+                    continue
+                raw_data = decoded[6:]
+                if raw_data == "[DONE]":
+                    break
                 try:
-                    events = json.loads(await r.text())
-                    if not isinstance(events, list):
-                        events = [events]
-                    for evt in events:
-                        for cand in evt.get("candidates", []):
-                            for part in cand.get("content", {}).get("parts", []):
-                                if "text" in part:
-                                    yield part["text"]
+                    evt = json.loads(raw_data)
+                    for cand in evt.get("candidates", []):
+                        for part in cand.get("content", {}).get("parts", []):
+                            if "text" in part:
+                                yield part["text"]
                 except (json.JSONDecodeError, KeyError):
                     pass
 
@@ -389,12 +764,21 @@ class ModelRouter:
         return bool(api_key)
 
     def _get_api_key(self, auth: str, model: str) -> str:
+        import os as _os
+
+        def _vault_or_env(vault_key: str) -> str:
+            try:
+                v = self._vault.get(vault_key)
+            except Exception:
+                v = None
+            return v or _os.environ.get(vault_key, "")
+
         if auth == "x-api-key":
-            return self._vault.get("ANTHROPIC_API_KEY") or ""
+            return _vault_or_env("ANTHROPIC_API_KEY")
         if auth == "google":
-            return self._vault.get("GOOGLE_API_KEY") or ""
+            return _vault_or_env("GOOGLE_API_KEY")
         if auth == "openrouter":
-            return self._vault.get("OPENROUTER_API_KEY") or ""
+            return _vault_or_env("OPENROUTER_API_KEY")
         mapping = {
             "openrouter/": "OPENROUTER_API_KEY",
             "swarmsync/":  "SWARMSYNC_API_KEY",
@@ -406,5 +790,5 @@ class ModelRouter:
         }
         for prefix, vault_key in mapping.items():
             if model.startswith(prefix):
-                return self._vault.get(vault_key) or ""
-        return self._vault.get("OPENAI_API_KEY") or ""
+                return _vault_or_env(vault_key)
+        return _vault_or_env("OPENAI_API_KEY")
