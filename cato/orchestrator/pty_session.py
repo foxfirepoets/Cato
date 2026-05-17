@@ -200,12 +200,22 @@ class PtySession:
     def terminate(self) -> None:
         """Terminate the process and stop the reader."""
         self._closed = True
+        if self._queue is not None:
+            try:
+                self._queue.put_nowait(b"")
+            except asyncio.QueueFull:
+                pass
         if self._proc is None:
             self._state = PtyState.dead
             return
         try:
-            if _PTY_BACKEND == "winpty" and hasattr(self._proc, "kill"):
-                self._proc.kill()
+            if _PTY_BACKEND == "winpty":
+                if hasattr(self._proc, "terminate"):
+                    self._proc.terminate()
+                if hasattr(self._proc, "kill") and getattr(self._proc, "isalive", lambda: False)():
+                    self._proc.kill()
+                if hasattr(self._proc, "close"):
+                    self._proc.close()
             elif _PTY_BACKEND == "ptyprocess":
                 self._proc.terminate(force=True)
         except Exception:
@@ -213,7 +223,7 @@ class PtySession:
         self._proc = None
         self._state = PtyState.dead
         if self._reader_thread is not None:
-            self._reader_thread.join(timeout=2.0)
+            self._reader_thread.join(timeout=0.5)
         logger.info("PTY session %s terminated", self.session_id)
 
     async def read_chunks(self) -> AsyncIterator[bytes]:

@@ -73,7 +73,11 @@ def test_status_shows_listeners_when_port_file_exists(cli_runner: CliRunner, tmp
     port_file = tmp_path / "cato.port"
     pid_file.write_text("99999")
     port_file.write_text("8090")
-    with patch("cato.cli._PID_FILE", pid_file), patch("cato.cli._PORT_FILE", port_file):
+    with (
+        patch("cato.cli._PID_FILE", pid_file),
+        patch("cato.cli._PORT_FILE", port_file),
+        patch("cato.cli._pid_alive", return_value=True),
+    ):
         result = cli_runner.invoke(main, ["status"])
     assert result.exit_code == 0
     assert "8090" in result.output

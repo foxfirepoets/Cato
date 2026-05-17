@@ -43,7 +43,9 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
 
         const protocol = wsBase.startsWith("https") ? "wss" : "ws";
         const host = wsBase.replace(/^https?:\/\//, "").replace(/^\/+/, "");
-        const wsUrl = `${protocol}://${host}/ws/pty/${sessionId}`;
+        const token = (window as Window & { __CATO_DAEMON_TOKEN__?: string }).__CATO_DAEMON_TOKEN__;
+        const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+        const wsUrl = `${protocol}://${host}/ws/pty/${sessionId}${qs}`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 

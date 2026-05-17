@@ -73,7 +73,7 @@ class TestSlotBudgetDefaults:
         assert SlotBudget().tier0_agents == 800
 
     def test_tier1_skill_default(self):
-        assert SlotBudget().tier1_skill == 600
+        assert SlotBudget().tier1_skill == 1600
 
     def test_tier1_memory_default(self):
         assert SlotBudget().tier1_memory == 2000
@@ -85,7 +85,7 @@ class TestSlotBudgetDefaults:
         assert SlotBudget().tier1_history == 4000
 
     def test_headroom_default(self):
-        assert SlotBudget().headroom == 2600
+        assert SlotBudget().headroom == 1600
 
     def test_custom_slot_budget_accepted(self):
         b = SlotBudget(tier0_identity=2000)

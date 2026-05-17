@@ -21,8 +21,22 @@ from ..platform import get_data_dir
 logger = logging.getLogger(__name__)
 
 _CATO_DIR = get_data_dir()
-_WORKSPACE_ROOT = _CATO_DIR / "workspace"
 _AUDIT_LOG = _CATO_DIR / "logs" / "file_audit.log"
+
+
+def _workspace_root() -> Path:
+    """Resolve the workspace root, honouring the ``CATO_WORKSPACE_DIR`` env
+    override.
+
+    BH-010 — `config.yaml`'s `workspace_dir` is bridged into the file tool
+    through this env var (set by ``cato_svc_runner.py`` at daemon startup).
+    Without it the tool silently falls back to ``~/.cato/workspace`` even
+    when the operator pointed `workspace_dir` elsewhere.
+    """
+    custom = os.environ.get("CATO_WORKSPACE_DIR")
+    if custom:
+        return Path(custom).expanduser().resolve()
+    return _CATO_DIR / "workspace"
 _MAX_READ_BYTES = 500 * 1024   # 500 KB
 _MAX_WRITE_BYTES = 1024 * 1024  # 1 MB
 
@@ -49,6 +63,7 @@ class FileTool:
         encoding = args.get("encoding", "utf-8")
         agent_id = args.get("agent_id", "main")
         recursive = bool(args.get("recursive", False))
+        root = args.get("root", "workspace")
 
         result = await self._run(
             action=action,
@@ -57,8 +72,13 @@ class FileTool:
             encoding=encoding,
             agent_id=agent_id,
             recursive=recursive,
+            root=root,
         )
         return json.dumps(result)
+
+    def _trusted_roots(self, agent_id: str) -> dict[str, Path]:
+        """Return the set of trusted root directories for this agent."""
+        return {"workspace": _workspace_root() / agent_id}
 
     async def _run(
         self,
@@ -68,25 +88,35 @@ class FileTool:
         encoding: str = "utf-8",
         agent_id: str = "main",
         recursive: bool = False,
+        root: str = "workspace",
     ) -> dict:
         """
         Perform file operations.
 
         Args:
-            action:   "read" | "write" | "append" | "delete" | "list" | "exists"
-            path:     Relative path within workspace (e.g. "notes/today.md")
+            action:   "read" | "write" | "append" | "delete" | "list" | "exists" | "roots"
+            path:     Relative path within root (e.g. "notes/today.md")
             content:  Content for write/append actions
             encoding: File encoding (default utf-8)
             agent_id: Agent workspace to use
+            root:     Named root key from _trusted_roots (default "workspace")
 
         Returns:
             {"success": bool, "content": str|None, "error": str|None, "path": str}
         """
-        workspace = _WORKSPACE_ROOT / agent_id
-        workspace.mkdir(parents=True, exist_ok=True)
+        if action == "roots":
+            roots = self._trusted_roots(agent_id)
+            return {"success": True, "content": json.dumps({k: str(v) for k, v in roots.items()}), "error": None, "path": ""}
+
+        roots = self._trusted_roots(agent_id)
+        base = roots.get(root)
+        if base is None:
+            return {"success": False, "content": None, "error": f"Unknown root: {root!r}. Valid: {list(roots)}", "path": path}
+
+        base.mkdir(parents=True, exist_ok=True)
 
         try:
-            safe = self._resolve_safe_path(workspace, path)
+            safe = self._resolve_safe_path(base, path)
         except ValueError as exc:
             self._audit(action, path, agent_id, success=False)
             return {"success": False, "content": None, "error": str(exc), "path": path}
@@ -104,7 +134,7 @@ class FileTool:
             return {
                 "success": False,
                 "content": None,
-                "error": f"Unknown action: {action!r}. Valid: {list(dispatch)}",
+                "error": f"Unknown action: {action!r}. Valid: {list(dispatch) + ['roots']}",
                 "path": str(safe),
             }
 

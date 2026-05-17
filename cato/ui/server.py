@@ -40,8 +40,13 @@ Mounts:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
+import os
+import re
+import secrets
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -55,6 +60,7 @@ _CODING_AGENT   = Path(__file__).parent / "coding_agent.html"
 _START_TIME     = time.monotonic()
 _MCP_RUNTIME_KEY = web.AppKey("mcp_runtime", object)
 _MCP_PROXY_SESSION_KEY = web.AppKey("mcp_proxy_session", ClientSession)
+_CLI_POOL_STARTUP_TASK_KEY = web.AppKey("cli_pool_startup_task", object)
 
 # Workspace identity files live here
 def _workspace_dir() -> Path:
@@ -77,25 +83,124 @@ def _workspace_dir() -> Path:
 
 _WORKSPACE_ALLOWED = {"SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md", "HEARTBEAT.md"}
 
+# ---------------------------------------------------------------------------
+# Daemon auth token (T6) — random per-process token written to ~/.cato/daemon.token
+# ---------------------------------------------------------------------------
+
+def _load_or_create_daemon_token() -> str:
+    """Load existing daemon token or generate a new one, write to data dir, and return it."""
+    from cato.platform import get_data_dir
+    token_path = get_data_dir() / "daemon.token"
+    if token_path.exists():
+        existing = token_path.read_text(encoding="utf-8").strip()
+        if len(existing) == 64:  # 32 bytes hex = 64 chars
+            return existing
+    token = secrets.token_hex(32)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(token, encoding="utf-8")
+    token_path.chmod(0o600)
+    return token
+
+
+_DAEMON_TOKEN: str = _load_or_create_daemon_token()
+
+# Paths that require the X-Cato-Token header (all non-GET mutation paths)
+_TOKEN_EXEMPT_METHODS = {"OPTIONS"}
+# Public read-only endpoints (static HTML pages + health probe)
+_TOKEN_EXEMPT_PATHS = {"/health", "/", "/coding-agent", "/api/activity"}
+_LOCAL_REMOTES = {"127.0.0.1", "::1", "localhost"}
+_SECRET_PATTERNS = [
+    re.compile(r"(?i)(api[_-]?key|token|secret|password)(['\"\s:=]+)([^,'\"\s}]+)"),
+    re.compile(r"\b(sk-[A-Za-z0-9_-]{12,})\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._\-]+", re.IGNORECASE),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\b\d{8,12}:[A-Za-z0-9_\-]{30,}\b"),
+]
+
+
+def _redact_log_text(text: str) -> str:
+    """Mask obvious credential values before exposing daemon logs through the UI."""
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups >= 3:
+            redacted = pattern.sub(r"\1\2[redacted]", redacted)
+        else:
+            redacted = pattern.sub("[redacted]", redacted)
+    return redacted
+
+
+@web.middleware
+async def auth_token_middleware(request: web.Request, handler):
+    """Require X-Cato-Token on non-read requests from non-Tauri origins."""
+    if request.method in _TOKEN_EXEMPT_METHODS:
+        return await handler(request)
+    if request.method == "GET" and request.path in _TOKEN_EXEMPT_PATHS:
+        return await handler(request)
+    # /coding-agent/{task_id} serves the SPA shell (static HTML) — no auth needed.
+    # The API routes under /api/coding-agent/* remain auth-protected.
+    if request.path.startswith("/coding-agent/") and not request.path.startswith("/coding-agent/api"):
+        return await handler(request)
+    token = (request.headers.get("X-Cato-Token", "")
+             or request.rel_url.query.get("token", ""))
+    if not token or not secrets.compare_digest(token, _DAEMON_TOKEN):
+        if (
+            request.method == "POST"
+            and request.path == "/api/heartbeat"
+            and (request.remote or "") in _LOCAL_REMOTES
+        ):
+            return await handler(request)
+        return web.Response(status=401, reason="Missing or invalid X-Cato-Token")
+    return await handler(request)
+
+
+_CORS_ALLOWED_ORIGINS = {"tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"}
+_LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+_SENSITIVE_PATHS = {"/api/vault/set", "/api/vault/delete", "/config"}
+_CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Cato-Token"
+
+
+def _is_localhost_origin(origin: str) -> bool:
+    """Strict scheme://host[:port] match — no startswith, no subdomain smuggling."""
+    if not origin:
+        return False
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if host == "::1":
+        host = "[::1]"
+    return host in _LOCALHOST_HOSTS and not parsed.path and not parsed.query
+
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
-    """Add CORS headers so the Tauri WebView2 (tauri://localhost origin) can
-    reach the daemon at http://127.0.0.1:8080 without being blocked."""
-    # Handle pre-flight OPTIONS requests
+    """CORS middleware — permits Tauri/localhost origins; blocks cross-origin
+    mutations to vault and config endpoints."""
+    origin = request.headers.get("Origin", "")
+    allowed = origin in _CORS_ALLOWED_ORIGINS or _is_localhost_origin(origin)
+    if request.path in _SENSITIVE_PATHS and not allowed and origin:
+        return web.Response(status=403, reason="Cross-origin requests not allowed for this endpoint")
+    allow_origin = origin if allowed else "tauri://localhost"
     if request.method == "OPTIONS":
         return web.Response(
             status=204,
             headers={
-                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Origin": allow_origin,
                 "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Headers": _CORS_ALLOWED_HEADERS,
+                "Vary": "Origin",
             },
         )
     response = await handler(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"] = allow_origin
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Headers"] = _CORS_ALLOWED_HEADERS
+    response.headers["Vary"] = "Origin"
     return response
 
 
@@ -106,10 +211,10 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         gateway: The Gateway instance. May be None for standalone testing;
                  pages will render but WebSocket will show disconnected state.
     """
-    app = web.Application(middlewares=[cors_middleware])
+    app = web.Application(middlewares=[cors_middleware, auth_token_middleware])
 
     async def mcp_runtime_ctx(app: web.Application):
-        """Start and stop the background MCP runtime alongside the aiohttp app."""
+        """Start and stop the MCP runtime without blocking desktop startup."""
         app[_MCP_RUNTIME_KEY] = None
         app[_MCP_PROXY_SESSION_KEY] = None
 
@@ -118,21 +223,47 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
             yield
             return
 
-        from cato.mcp import CatoMCPRuntime
-
-        runtime = CatoMCPRuntime(gateway, cfg)
+        runtime: Any | None = None
         proxy_session: ClientSession | None = None
-        await runtime.start()
-        proxy_session = ClientSession(timeout=ClientTimeout(total=300))
-        app[_MCP_RUNTIME_KEY] = runtime
-        app[_MCP_PROXY_SESSION_KEY] = proxy_session
+
+        async def start_mcp_runtime() -> None:
+            nonlocal runtime, proxy_session
+            try:
+                # Keep desktop startup responsive; MCP can warm after chat is online.
+                await asyncio.sleep(60)
+                from cato.mcp.runtime import CatoMCPRuntime
+
+                runtime = CatoMCPRuntime(gateway, cfg)
+                await runtime.start()
+                proxy_session = ClientSession(timeout=ClientTimeout(total=300))
+                app[_MCP_RUNTIME_KEY] = runtime
+                app[_MCP_PROXY_SESSION_KEY] = proxy_session
+                logger.info(
+                    "MCP runtime ready at http://%s:%s%s",
+                    runtime.host,
+                    runtime.port,
+                    runtime.mount_path,
+                )
+            except ModuleNotFoundError as exc:
+                logger.warning("MCP runtime disabled because dependency is unavailable: %s", exc)
+                runtime = None
+            except Exception as exc:
+                logger.warning("MCP runtime disabled after startup failure: %s", exc, exc_info=True)
+                runtime = None
+
+        startup_task = asyncio.create_task(start_mcp_runtime(), name="cato-mcp-runtime-start")
 
         try:
             yield
         finally:
+            if not startup_task.done():
+                startup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await startup_task
             if proxy_session is not None:
                 await proxy_session.close()
-            await runtime.stop()
+            if runtime is not None:
+                await runtime.stop()
             app[_MCP_RUNTIME_KEY] = None
             app[_MCP_PROXY_SESSION_KEY] = None
 
@@ -142,9 +273,27 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
     # Route handlers                                                       #
     # ------------------------------------------------------------------ #
 
-    async def serve_dashboard(request: web.Request) -> web.FileResponse:
-        """Serve the single-page dashboard HTML."""
-        return web.FileResponse(_DASHBOARD)
+    async def serve_dashboard(request: web.Request) -> web.Response:
+        """Serve the single-page dashboard HTML with token injected for WS auth."""
+        html = _DASHBOARD.read_text(encoding="utf-8")
+        injection = (
+            "<script>\n"
+            f"window.__CATO_TOKEN__ = {repr(_DAEMON_TOKEN)};\n"
+            "const __catoFetch = window.fetch.bind(window);\n"
+            "window.fetch = (input, init = {}) => {\n"
+            "  const headers = new Headers(init.headers || {});\n"
+            "  if (!headers.has('X-Cato-Token')) headers.set('X-Cato-Token', window.__CATO_TOKEN__ || '');\n"
+            "  return __catoFetch(input, { ...init, headers });\n"
+            "};\n"
+            "</script>"
+        )
+        html = html.replace("</head>", injection + "\n</head>", 1)
+        # Patch connectWS to append token as query param
+        html = html.replace(
+            "wsProto + '//' + location.host + '/ws'",
+            "wsProto + '//' + location.host + '/ws?token=' + (window.__CATO_TOKEN__ || '')",
+        )
+        return web.Response(text=html, content_type="text/html")
 
     async def health(request: web.Request) -> web.Response:
         """Return JSON health payload consumed by the UI health pill."""
@@ -223,6 +372,13 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
 
     async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         """Upgrade HTTP → WebSocket and proxy messages through the gateway."""
+        # FIX-C1: Authenticate before upgrading the WebSocket connection.
+        # Accept token from header or query param (query param needed for WS clients
+        # that cannot send custom headers during the HTTP upgrade handshake).
+        token = (request.headers.get("X-Cato-Token", "")
+                 or request.rel_url.query.get("token", ""))
+        if not token or not secrets.compare_digest(token, _DAEMON_TOKEN):
+            return web.Response(status=401, reason="Missing or invalid X-Cato-Token")
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
 
@@ -335,6 +491,96 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         except Exception as exc:
             logger.error("chat_history error: %s", exc)
             return web.json_response([], status=500)
+
+    # ------------------------------------------------------------------ #
+    # File Upload for Chat                                                  #
+    # ------------------------------------------------------------------ #
+
+    _UPLOAD_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "cato" / "uploads"
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
+    _UPLOAD_ALLOWED_EXTS = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+        ".pdf",
+        ".csv", ".tsv", ".xlsx", ".xls",
+        ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".md", ".txt", ".html", ".css",
+        ".log",
+    }
+    _UPLOAD_BLOCKED_EXTS = {
+        ".exe", ".bat", ".cmd", ".com", ".scr", ".msi", ".dll", ".sys",
+        ".ps1", ".psm1", ".vbs", ".js.lnk", ".lnk", ".jar", ".sh",
+    }
+
+    async def chat_upload(request: web.Request) -> web.Response:
+        """POST /api/chat/upload — Accept multipart file upload for chat context.
+
+        Returns the saved file path and metadata so the frontend can reference
+        it in the next chat message.
+        """
+        try:
+            reader = await request.multipart()
+            if reader is None:
+                return web.json_response({"error": "multipart body required"}, status=400)
+
+            field = await reader.next()
+            if field is None or field.name != "file":
+                return web.json_response({"error": "expected field named 'file'"}, status=400)
+
+            original_name = field.filename or "upload"
+            # Sanitize filename — strip path separators, restrict charset
+            safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in original_name)
+            safe_name = safe_name.lstrip(".") or "upload"
+            # Block executable extensions (incl. double-extensions like foo.txt.exe)
+            lowered = safe_name.lower()
+            for blocked in _UPLOAD_BLOCKED_EXTS:
+                if lowered.endswith(blocked):
+                    return web.json_response(
+                        {"error": f"file type not allowed: {blocked}"}, status=415,
+                    )
+            primary_ext = Path(safe_name).suffix.lower()
+            if primary_ext and primary_ext not in _UPLOAD_ALLOWED_EXTS:
+                return web.json_response(
+                    {"error": f"file type not allowed: {primary_ext}"}, status=415,
+                )
+            ts = int(time.time())
+            dest = _UPLOAD_DIR / f"{ts}_{safe_name}"
+
+            size = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = await field.read_chunk(8192)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > _MAX_UPLOAD_SIZE:
+                        dest.unlink(missing_ok=True)
+                        return web.json_response({"error": "file too large (max 50MB)"}, status=413)
+                    f.write(chunk)
+
+            # Determine file type for display
+            ext = Path(safe_name).suffix.lower()
+            file_type = "document"
+            if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"):
+                file_type = "image"
+            elif ext in (".pdf",):
+                file_type = "pdf"
+            elif ext in (".csv", ".tsv", ".xlsx", ".xls"):
+                file_type = "spreadsheet"
+            elif ext in (".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".md", ".txt", ".html", ".css"):
+                file_type = "code"
+
+            logger.info("File uploaded: %s (%d bytes, type=%s)", safe_name, size, file_type)
+
+            return web.json_response({
+                "status": "ok",
+                "filename": safe_name,
+                "path": str(dest),
+                "size": size,
+                "type": file_type,
+            })
+        except Exception as exc:
+            logger.error("chat_upload error: %s", exc)
+            return web.json_response({"error": str(exc)}, status=500)
 
     async def kill_session(request: web.Request) -> web.Response:
         """DELETE /api/sessions/{session_id} — stop a session lane."""
@@ -702,6 +948,21 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
             return web.json_response({"error": str(exc)}, status=500)
 
     # ------------------------------------------------------------------ #
+    # Routing History                                                      #
+    # ------------------------------------------------------------------ #
+
+    async def get_routing_history(request: web.Request) -> web.Response:
+        """GET /api/usage/routing — return model routing decision history."""
+        try:
+            from cato.router import get_routing_history as _get_history
+            history = _get_history()
+            limit = int(request.rel_url.query.get("limit", "100"))
+            return web.json_response(history[-limit:])
+        except Exception as exc:
+            logger.error("get_routing_history error: %s", exc)
+            return web.json_response([], status=500)
+
+    # ------------------------------------------------------------------ #
     # Logs                                                                 #
     # ------------------------------------------------------------------ #
 
@@ -713,7 +974,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
                 "ts": record.created,
                 "level": record.levelname,
                 "name": record.name,
-                "msg": self.format(record),
+                "msg": _redact_log_text(self.format(record)),
             })
             if len(_log_buffer) > 500:
                 del _log_buffer[:-500]
@@ -1924,6 +2185,16 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
             return web.json_response({"adapters": []}, status=500)
 
     # ------------------------------------------------------------------ #
+    # Activity indicator                                                   #
+    # ------------------------------------------------------------------ #
+
+    async def get_activity(request: web.Request) -> web.Response:
+        """GET /api/activity — return whether the agent is currently working."""
+        if gateway is not None and hasattr(gateway, "get_activity"):
+            return web.json_response(gateway.get_activity())
+        return web.json_response({"busy": False, "session_id": "", "task": "", "updated_at": 0})
+
+    # ------------------------------------------------------------------ #
     # Heartbeat status                                                     #
     # ------------------------------------------------------------------ #
 
@@ -2063,6 +2334,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
     app.router.add_post("/api/compact",                  compact_session)
     # Cross-channel chat history (web + Telegram)
     app.router.add_get("/api/chat/history",              chat_history)
+    app.router.add_post("/api/chat/upload",              chat_upload)
     # Skills
     app.router.add_get("/api/skills",                         list_skills)
     app.router.add_get("/api/skills/{name}/content",          get_skill_content)
@@ -2082,6 +2354,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
     app.router.add_get("/api/budget/summary",            budget_summary)
     # Usage
     app.router.add_get("/api/usage/summary",             usage_summary)
+    app.router.add_get("/api/usage/routing",            get_routing_history)
     # Logs
     app.router.add_get("/api/logs",                      get_logs)
     # Audit
@@ -2128,6 +2401,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
     app.router.add_get("/api/diagnostics/habits",                diagnostics_habits)
     # Adapters
     app.router.add_get("/api/adapters",                 list_adapters)
+    app.router.add_get("/api/activity",                  get_activity)
 
     app.router.add_get("/api/tokens",                    list_tokens)
     app.router.add_post("/api/tokens",                   create_token)
@@ -2163,22 +2437,41 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
     # ------------------------------------------------------------------ #
 
     async def _start_cli_pool(app: web.Application) -> None:
-        """Warm up persistent CLI processes on server start."""
+        """Schedule persistent CLI process warmup after server start."""
         try:
             from cato.orchestrator.cli_process_pool import get_pool
             pool = get_pool()
-            await pool.start_all()
             # Attach the pool to the gateway so /api/cli/{name}/restart can
             # access the same singleton instance used here.
             if gateway is not None:
                 setattr(gateway, "_cli_pool", pool)
-            logger.info("CLI process pool started")
+
+            async def _warm_pool_later() -> None:
+                try:
+                    await asyncio.sleep(120)
+                    await pool.start_all()
+                    logger.info("CLI process pool started")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("CLI process pool failed to start: %s", exc)
+
+            app[_CLI_POOL_STARTUP_TASK_KEY] = asyncio.create_task(
+                _warm_pool_later(),
+                name="cato-cli-pool-warmup",
+            )
         except Exception as exc:
-            logger.warning("CLI process pool failed to start: %s", exc)
+            logger.warning("CLI process pool failed to schedule startup: %s", exc)
 
     async def _stop_cli_pool(app: web.Application) -> None:
         """Shut down persistent CLI processes on server stop."""
         try:
+            startup_task = app.get(_CLI_POOL_STARTUP_TASK_KEY)
+            if startup_task is not None and not startup_task.done():
+                startup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await startup_task
+
             from cato.orchestrator.cli_process_pool import get_pool
             pool = get_pool()
             await pool.stop_all()

@@ -32,10 +32,126 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-
 logger = logging.getLogger(__name__)
+
+
+def _mcp_imports() -> tuple[Any, Any, Any]:
+    """Lazy-load real MCP SDK symbols.
+
+    The local mcp/ directory at the project root shadows the installed MCP SDK.
+    Tests that mock the client don't need the real SDK — they patch _stdio_client
+    and _ClientSession on the instance after construction.  Return lightweight
+    stubs so __init__ never fails at import time; the stubs get replaced by mocks
+    in tests and by the real SDK when actually running the daemon.
+    """
+    import site as _site
+    import importlib.util as _ilu
+    import sys as _sys
+
+    # Try to find and load the real SDK from site-packages, bypassing the shadow.
+    sdk_dir: str | None = None
+    candidates: list[str] = []
+    try:
+        candidates += _site.getsitepackages()
+    except AttributeError:
+        pass
+    try:
+        candidates.append(_site.getusersitepackages())
+    except AttributeError:
+        pass
+
+    from pathlib import Path as _P
+    for sp in candidates:
+        p = _P(sp) / "mcp" / "__init__.py"
+        if p.exists():
+            sdk_dir = str(_P(sp) / "mcp")
+            break
+
+    if sdk_dir:
+        _SDK_KEY = "_cato_mcp_sdk"
+        if _SDK_KEY not in _sys.modules:
+            # Register bare sdk module so its relative imports (mcp.types, etc.) work
+            # by pre-populating sys.modules with the real SDK path before exec.
+            import os as _os
+            _sdk_p = _P(sdk_dir)
+            for _root, _dirs, _files in _os.walk(sdk_dir):
+                for _f in _files:
+                    if not _f.endswith(".py"):
+                        continue
+                    _abs = _os.path.join(_root, _f)
+                    _rel = _os.path.relpath(_abs, sdk_dir).replace("\\", "/")
+                    _parts = _rel[:-3].split("/")  # strip .py
+                    if _parts[-1] == "__init__":
+                        _parts = _parts[:-1]
+                    _mod_name = "mcp" + ("." + ".".join(_parts) if _parts else "")
+                    if _mod_name not in _sys.modules:
+                        _spec2 = _ilu.spec_from_file_location(
+                            _mod_name, _abs,
+                            submodule_search_locations=(
+                                [_os.path.join(_root)] if _f == "__init__.py" else None
+                            ),
+                        )
+                        if _spec2:
+                            _sys.modules[_mod_name] = _ilu.module_from_spec(_spec2)
+
+            # Exec the top-level init to populate ClientSession etc.
+            _top_spec = _ilu.spec_from_file_location(
+                "mcp", str(_sdk_p / "__init__.py"),
+                submodule_search_locations=[sdk_dir],
+            )
+            if _top_spec and _top_spec.loader:
+                try:
+                    _top_spec.loader.exec_module(_sys.modules["mcp"])  # type: ignore[union-attr]
+                    _sys.modules[_SDK_KEY] = _sys.modules["mcp"]
+                except Exception:
+                    pass
+
+        _sdk = _sys.modules.get(_SDK_KEY)
+        if _sdk:
+            _ClientSession = getattr(_sdk, "ClientSession", None)
+            _StdioServerParameters = getattr(_sdk, "StdioServerParameters", None)
+            _stdio_mod = _sys.modules.get("mcp.client.stdio")
+            _stdio_client = getattr(_stdio_mod, "stdio_client", None) if _stdio_mod else None
+            if _ClientSession and _StdioServerParameters and _stdio_client:
+                return _ClientSession, _StdioServerParameters, _stdio_client
+
+    # Fallback stubs — tests replace these via monkeypatch/mock
+    class _StubSession:
+        pass
+
+    class _StubParams:
+        def __init__(self, **kwargs: Any) -> None:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    async def _stub_stdio(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("MCP SDK not available — install 'mcp' package")
+
+    return _StubSession, _StubParams, _stub_stdio  # type: ignore[return-value]
+
+
+# Module-level names that tests patch via patch("cato.mcp.windows_client.stdio_client").
+# Populated lazily on first WindowsMCPClient instantiation.
+ClientSession: Any = None
+StdioServerParameters: Any = None
+stdio_client: Any = None
+_mcp_loaded = False
+
+
+def _ensure_mcp_loaded() -> None:
+    """Populate module-level MCP names if they have not been set yet."""
+    global ClientSession, StdioServerParameters, stdio_client, _mcp_loaded
+    if not _mcp_loaded:
+        _cs, _sp, _sc = _mcp_imports()
+        # Only overwrite if not already set by a test mock or earlier call
+        if ClientSession is None:
+            ClientSession = _cs
+        if StdioServerParameters is None:
+            StdioServerParameters = _sp
+        if stdio_client is None:
+            stdio_client = _sc
+        _mcp_loaded = True
+
 
 # Default command to launch the Windows MCP server.
 # ``uvx`` resolves and runs the package without a permanent install.
@@ -137,12 +253,14 @@ class WindowsMCPClient:
                  ``{"MODE": "remote", "SANDBOX_ID": "...", "API_KEY": "..."}``
                  to proxy through the cloud windowsmcp.io VMs.
         """
-        self._server_params = StdioServerParameters(
+        _ensure_mcp_loaded()
+        import cato.mcp.windows_client as _self_mod
+        self._server_params = _self_mod.StdioServerParameters(
             command=command,
             args=args if args is not None else list(_DEFAULT_ARGS),
             env=env,
         )
-        self._session: Optional[ClientSession] = None
+        self._session: Optional[Any] = None
         self._cm_stack: list[Any] = []   # context managers to exit on stop()
         self._errlog: Any = None          # file handle for server stderr (Windows)
 
@@ -166,11 +284,12 @@ class WindowsMCPClient:
         # stdio_client and ClientSession are entered manually so stop() can exit
         # them cleanly.  On any failure we call stop() to drain _cm_stack.
         try:
-            transport_cm = stdio_client(self._server_params, errlog=errlog)
+            import cato.mcp.windows_client as _self_mod
+            transport_cm = _self_mod.stdio_client(self._server_params, errlog=errlog)
             read_stream, write_stream = await transport_cm.__aenter__()
             self._cm_stack.append(transport_cm)
 
-            session_cm = ClientSession(read_stream, write_stream)
+            session_cm = _self_mod.ClientSession(read_stream, write_stream)
             session = await session_cm.__aenter__()
             self._cm_stack.append(session_cm)
 

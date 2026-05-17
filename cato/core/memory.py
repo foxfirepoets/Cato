@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -200,11 +202,65 @@ class MemorySystem:
     # Lazy embedding model
     # ------------------------------------------------------------------
 
-    def _get_embed_model(self) -> SentenceTransformer:
-        if self._embed_model is None:
-            logger.info("Loading embedding model %s ...", _MODEL_NAME)
-            self._embed_model = SentenceTransformer(_MODEL_NAME)
-        return self._embed_model
+    def _get_embed_model(self) -> Optional[SentenceTransformer]:
+        """
+        Lazy-load the sentence-transformer model with a 3-attempt retry loop.
+
+        Sets a Windows-safe cache path before instantiation and creates the
+        directory unconditionally.  On all-attempts-failed, sets
+        ``self._embed_model`` to ``None`` and logs a warning so the daemon
+        continues in degraded (BM25-only) mode.
+
+        Returns ``None`` when the model could not be loaded.
+        """
+        if self._embed_model is not None:
+            return self._embed_model
+
+        # --- resolve a Windows-safe cache directory ---------------------------
+        if sys.platform == "win32":
+            local_app_data = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+            hf_cache = str(Path(local_app_data) / "cato" / "hf_cache")
+        else:
+            hf_cache = str(Path.home() / ".cache" / "cato" / "hf")
+
+        os.makedirs(hf_cache, exist_ok=True)
+        os.environ["HF_HOME"] = hf_cache
+        os.environ["SENTENCE_TRANSFORMERS_HOME"] = hf_cache
+
+        # --- 3-attempt retry loop ---------------------------------------------
+        _MAX_ATTEMPTS = 3
+        _RETRY_SLEEP = 2  # seconds between attempts
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            logger.info(
+                "Loading embedding model %s (attempt %d/%d, cache=%s) ...",
+                _MODEL_NAME, attempt, _MAX_ATTEMPTS, hf_cache,
+            )
+            try:
+                self._embed_model = SentenceTransformer(_MODEL_NAME)
+                logger.info(
+                    "Embedding model %s loaded successfully on attempt %d.",
+                    _MODEL_NAME, attempt,
+                )
+                return self._embed_model
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    "Embedding model load attempt %d/%d failed: %s",
+                    attempt, _MAX_ATTEMPTS, exc,
+                )
+                if attempt < _MAX_ATTEMPTS:
+                    time.sleep(_RETRY_SLEEP)
+
+        # All attempts exhausted — degrade gracefully
+        logger.warning(
+            "All %d attempts to load embedding model %s failed (last error: %s). "
+            "Semantic search is disabled; BM25 keyword search still works.",
+            _MAX_ATTEMPTS, _MODEL_NAME, last_exc,
+        )
+        self._embed_model = None
+        return None
 
     # ------------------------------------------------------------------
     # DB helpers
@@ -270,8 +326,18 @@ class MemorySystem:
     # ------------------------------------------------------------------
 
     def _embed(self, texts: list[str]) -> list[bytes]:
-        """Return embedding blobs (numpy float32 arrays serialised as bytes)."""
+        """
+        Return embedding blobs (numpy float32 arrays serialised as bytes).
+
+        Returns a list of zero-filled blobs (384-dim float32) when the model is
+        unavailable so callers can proceed without crashing.
+        """
         model = self._get_embed_model()
+        if model is None:
+            # Degraded mode: return zero vectors so storage/search still work
+            # (semantic scores will all be 0.0; BM25 will carry the ranking)
+            zero = np.zeros(384, dtype=np.float32).tobytes()
+            return [zero] * len(texts)
         vecs = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return [v.astype(np.float32).tobytes() for v in vecs]
 
@@ -449,10 +515,15 @@ class MemorySystem:
         bm25_scores = bm25_scores_raw / bm25_max
 
         # Semantic
-        q_vec = self._get_embed_model().encode(
-            [query], normalize_embeddings=True, show_progress_bar=False
-        )[0].astype(np.float32)
-        sem_scores = np.array([self._cosine(q_vec, e) for e in embeddings])
+        _sem_model = self._get_embed_model()
+        if _sem_model is not None:
+            q_vec = _sem_model.encode(
+                [query], normalize_embeddings=True, show_progress_bar=False
+            )[0].astype(np.float32)
+            sem_scores = np.array([self._cosine(q_vec, e) for e in embeddings])
+        else:
+            # Degraded mode: semantic scores all zero; fall back to BM25-only ranking
+            sem_scores = np.zeros(len(contents), dtype=np.float32)
 
         # Combined
         combined = 0.4 * bm25_scores + 0.6 * sem_scores
@@ -615,13 +686,18 @@ class MemorySystem:
             return []
 
         # Build query embedding
-        q_vec = self._get_embed_model().encode(
-            [query], normalize_embeddings=True, show_progress_bar=False
-        )[0].astype(np.float32)
+        _sem_model = self._get_embed_model()
+        if _sem_model is not None:
+            q_vec: Optional[np.ndarray] = _sem_model.encode(
+                [query], normalize_embeddings=True, show_progress_bar=False
+            )[0].astype(np.float32)
+        else:
+            # Degraded mode: no semantic ranking; all rows score 0.0
+            q_vec = None
 
         scored: list[tuple[float, sqlite3.Row]] = []
         for row in rows:
-            if row["embedding"] is None:
+            if q_vec is None or row["embedding"] is None:
                 score = 0.0
             else:
                 row_vec = self._bytes_to_vec(row["embedding"])

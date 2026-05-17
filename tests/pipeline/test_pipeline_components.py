@@ -447,6 +447,18 @@ class TestTelegramBridge:
         assert "8622193070" not in content, "launch_bridge.py still has old Cato bot token!"
 
     def test_bridge_log_shows_application_started(self):
+        import subprocess
+        import pytest as _pytest
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-WmiObject Win32_Process -Filter \"Name='python.exe'\" | "
+             "Where-Object { $_.CommandLine -like '*cato_telegram_bridge*' } | "
+             "Select-Object -ExpandProperty ProcessId"],
+            capture_output=True, text=True, timeout=10,
+        )
+        pids = [l.strip() for l in result.stdout.strip().splitlines() if l.strip().isdigit()]
+        if len(pids) == 0:
+            _pytest.skip("cato_telegram_bridge.py is not running — skipping log content check")
         log = Path(r"C:\Users\Administrator\Desktop\Cato\logs\telegram_bridge.log")
         assert log.exists(), "Bridge log file does not exist"
         content = log.read_text(encoding="utf-8", errors="replace")
@@ -583,6 +595,7 @@ CURSOR_NODE   = r"C:\Users\Administrator\AppData\Local\cursor-agent\versions\202
 CURSOR_INDEX  = r"C:\Users\Administrator\AppData\Local\cursor-agent\versions\2026.02.27-e7d2ef6\index.js"
 
 
+@pytest.mark.live
 class TestLiveCodexHello:
     """
     Fires a real 'codex exec' call and verifies we get a response.
@@ -648,6 +661,7 @@ class TestLiveCodexHello:
         assert '"-q"' not in src,     "invoke_codex.py must NOT use invalid '-q' flag"
 
 
+@pytest.mark.live
 class TestLiveCursorHello:
     """
     Fires a real cursor-agent --print call and verifies we get a response.

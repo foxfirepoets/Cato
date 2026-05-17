@@ -8,12 +8,14 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .distiller import Distiller
-from .memory import MemorySystem
 from ..config import CatoConfig
 from ..platform import get_data_dir
+
+if TYPE_CHECKING:
+    from .memory import MemorySystem
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,7 @@ def backfill_transcript_learning(
     last_turn_end = memory.latest_distilled_turn_end(session_id)
     start = last_turn_end + 1
     distillations_added = 0
+
     distiller = Distiller()
     while len(turns) - start >= block_size:
         block = turns[start:start + block_size]
@@ -281,6 +284,8 @@ class MemoryUpkeepService:
         self._interval_sec = max(120, int(interval_sec))
 
     def run_once_sync(self) -> dict[str, int | str]:
+        from .memory import MemorySystem
+
         agent_id = getattr(self._cfg, "agent_name", "cato")
         workspace_dir = self._cfg.workspace_path()
         data_dir = get_data_dir()
@@ -308,7 +313,6 @@ class MemoryUpkeepService:
         }
 
     async def run_forever(self) -> None:
-        await self.run_once()
         while True:
             try:
                 await time_async_sleep(self._interval_sec)

@@ -33,7 +33,6 @@ function QueryTiersTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     setError(null);
     try {
@@ -46,10 +45,10 @@ function QueryTiersTab({ httpPort }: { httpPort: number }) {
       setLoading(false);
       setFetched(true);
     }
-  }, [fetched, httpPort]);
+  }, [httpPort]);
 
   // Trigger on mount
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   const TIER_COLORS: Record<string, string> = {
     TIER_A: "#4ade80",
@@ -111,7 +110,6 @@ function ContradictionsTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     setError(null);
     try {
@@ -124,9 +122,9 @@ function ContradictionsTab({ httpPort }: { httpPort: number }) {
       setLoading(false);
       setFetched(true);
     }
-  }, [fetched, httpPort]);
+  }, [httpPort]);
 
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;
@@ -230,7 +228,6 @@ function DecisionsTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     setError(null);
     try {
@@ -243,9 +240,9 @@ function DecisionsTab({ httpPort }: { httpPort: number }) {
       setLoading(false);
       setFetched(true);
     }
-  }, [fetched, httpPort]);
+  }, [httpPort]);
 
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;
@@ -355,7 +352,6 @@ function AnomaliesTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     setError(null);
     try {
@@ -368,9 +364,9 @@ function AnomaliesTab({ httpPort }: { httpPort: number }) {
       setLoading(false);
       setFetched(true);
     }
-  }, [fetched, httpPort]);
+  }, [httpPort]);
 
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;
@@ -441,7 +437,6 @@ function CorrectionsTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     setError(null);
     try {
@@ -454,9 +449,9 @@ function CorrectionsTab({ httpPort }: { httpPort: number }) {
       setLoading(false);
       setFetched(true);
     }
-  }, [fetched, httpPort]);
+  }, [httpPort]);
 
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;
@@ -520,7 +515,6 @@ function DisagreementsTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     try {
       const r = await fetch(`http://127.0.0.1:${httpPort}/api/diagnostics/disagreements`);
@@ -528,8 +522,8 @@ function DisagreementsTab({ httpPort }: { httpPort: number }) {
       setData(await r.json());
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); setFetched(true); }
-  }, [fetched, httpPort]);
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  }, [httpPort]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;
@@ -562,7 +556,6 @@ function EpistemicTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     try {
       const r = await fetch(`http://127.0.0.1:${httpPort}/api/diagnostics/epistemic`);
@@ -570,8 +563,8 @@ function EpistemicTab({ httpPort }: { httpPort: number }) {
       setData(await r.json());
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); setFetched(true); }
-  }, [fetched, httpPort]);
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  }, [httpPort]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;
@@ -611,7 +604,6 @@ function ContextBudgetTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     try {
       const r = await fetch(`http://127.0.0.1:${httpPort}/api/diagnostics/context-budget`);
@@ -619,8 +611,8 @@ function ContextBudgetTab({ httpPort }: { httpPort: number }) {
       setData(await r.json());
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); setFetched(true); }
-  }, [fetched, httpPort]);
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  }, [httpPort]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;
@@ -671,7 +663,6 @@ function RetrievalTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     try {
       const r = await fetch(`http://127.0.0.1:${httpPort}/api/diagnostics/retrieval`);
@@ -679,8 +670,8 @@ function RetrievalTab({ httpPort }: { httpPort: number }) {
       setData(await r.json());
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); setFetched(true); }
-  }, [fetched, httpPort]);
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  }, [httpPort]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;
@@ -716,7 +707,6 @@ function HabitsTab({ httpPort }: { httpPort: number }) {
   const [fetched, setFetched] = useState(false);
 
   const fetch_ = useCallback(async () => {
-    if (fetched) return;
     setLoading(true);
     try {
       const r = await fetch(`http://127.0.0.1:${httpPort}/api/diagnostics/habits`);
@@ -724,8 +714,8 @@ function HabitsTab({ httpPort }: { httpPort: number }) {
       setData(await r.json());
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); setFetched(true); }
-  }, [fetched, httpPort]);
-  React.useEffect(() => { fetch_(); }, [fetch_]);
+  }, [httpPort]);
+  React.useEffect(() => { if (!fetched) fetch_(); }, [fetched, fetch_]);
 
   if (loading) return <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>;
   if (error) return <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>;

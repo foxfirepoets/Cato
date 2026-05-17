@@ -28,9 +28,21 @@ logger = logging.getLogger(__name__)
 _CATO_DIR = get_data_dir()
 _AUDIT_LOG = _CATO_DIR / "logs" / "shell_audit.log"
 _APPROVALS_FILE = _CATO_DIR / "exec-approvals.json"
-_DEFAULT_WORKSPACE = _CATO_DIR / "workspace"
 _MAX_OUTPUT_CHARS = 8000
 _MAX_TIMEOUT = 300
+
+
+def _default_workspace() -> Path:
+    """Resolve the shell tool's default cwd, honouring ``CATO_WORKSPACE_DIR``.
+
+    BH-010 — bridge config.yaml's `workspace_dir` into the shell tool.
+    Without this the tool's default cwd (and the clamp boundary for
+    gateway/sandbox modes) drifts away from the operator-configured path.
+    """
+    custom = os.environ.get("CATO_WORKSPACE_DIR")
+    if custom:
+        return Path(custom).expanduser().resolve()
+    return _CATO_DIR / "workspace"
 
 
 class ShellTool:
@@ -45,9 +57,11 @@ class ShellTool:
     """
 
     DEFAULT_ALLOWLIST: list[str] = [
-        "ls", "cat", "head", "tail", "grep", "find", "wc", "echo",
+        "ls", "cat", "head", "tail", "grep", "find", "wc", "echo", "printf",
         "python3", "python", "git",
         "mkdir", "cp", "mv", "chmod", "pwd", "env", "which", "date",
+        "sort", "uniq", "sed", "awk", "tr", "cut", "tee", "touch", "rm",
+        "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
     ]
 
     # Extended allowlist — opt-in only, NOT in DEFAULT_ALLOWLIST
@@ -65,7 +79,7 @@ class ShellTool:
         """Dispatch from agent_loop tool registry (receives raw args dict)."""
         command = args.get("command", "")
         timeout = min(int(args.get("timeout", 30)), _MAX_TIMEOUT)
-        cwd = args.get("cwd") or str(_DEFAULT_WORKSPACE)
+        cwd = args.get("cwd") or str(_default_workspace())
 
         # Auto-upgrade to full mode for PowerShell commands so they can run
         # anywhere on the system with unrestricted access.
@@ -79,7 +93,7 @@ class ShellTool:
         # Only clamp cwd to workspace root in sandbox/gateway mode.
         # Full mode (PowerShell) may need to operate anywhere on the system.
         if mode != "full":
-            workspace_root = _CATO_DIR / "workspace"
+            workspace_root = _default_workspace()
             if cwd:
                 cwd_path = Path(cwd).resolve()
                 try:
@@ -109,7 +123,7 @@ class ShellTool:
         Returns:
             {"stdout": str, "stderr": str, "returncode": int, "truncated": bool}
         """
-        work_dir = Path(cwd or _DEFAULT_WORKSPACE)
+        work_dir = Path(cwd or _default_workspace())
         work_dir.mkdir(parents=True, exist_ok=True)
 
         if mode == "gateway":

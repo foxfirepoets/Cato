@@ -139,11 +139,19 @@ export const AuthKeysView: React.FC<AuthKeysViewProps> = ({ httpPort }) => {
   };
 
   const deleteKey = async (key: string) => {
-    await fetch(`${base}/api/vault/delete`, {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key }),
-    });
+    try {
+      const r = await fetch(`${base}/api/vault/delete`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key }),
+      });
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        console.error("Delete key failed:", data.message || r.statusText);
+      }
+    } catch (e) {
+      console.error("Delete key error:", e);
+    }
     await fetchData();
   };
 

@@ -257,12 +257,13 @@ class TestTokenChecker:
         assert result.authorized is False
         assert "ceiling exceeded" in result.reason.lower()
 
-    def test_unknown_tool_allows_proceed(self, tmp_path: Path) -> None:
+    def test_unknown_tool_requires_confirmation(self, tmp_path: Path) -> None:
         store = make_store(tmp_path)
         store.create(["file.read"], 100.0, 3600)
         checker = TokenChecker(token_store=store)
         result = checker.check_authorization("totally_unknown_tool_xyz", {}, "sess-1")
-        assert result.authorized is True
+        assert result.authorized is False
+        assert result.requires_user_confirmation is True
         assert "no mapped category" in result.reason
 
     def test_auth_result_fields_populated(self, tmp_path: Path) -> None:

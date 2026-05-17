@@ -89,3 +89,7 @@ ignore = ["E501"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 norecursedirs = [".git", ".tox", "dist", "build", "*.egg", ".venv", "venv", ".claude", "node_modules"]
+markers = [
+    "live: requires live external CLI subprocess (codex, cursor) — skip by default, run with -m live",
+]
+addopts = "-m 'not live'"

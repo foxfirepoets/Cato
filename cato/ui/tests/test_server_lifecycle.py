@@ -8,6 +8,7 @@ Tests for cato/ui/server.py — focusing on:
 - Config POST returns ok
 """
 
+import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from cato.ui import server as server_module
 from cato.ui.server import create_ui_app
 
 
@@ -31,6 +33,17 @@ async def _make_app(gateway=None) -> web.Application:
              create=True,
          ):
         return await create_ui_app(gateway=gateway)
+
+
+def _auth_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {"X-Cato-Token": server_module._DAEMON_TOKEN}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _cli_pool_startup_task(app: web.Application) -> asyncio.Task:
+    return app[server_module._CLI_POOL_STARTUP_TASK_KEY]
 
 
 # ------------------------------------------------------------------ #
@@ -64,16 +77,21 @@ async def test_create_ui_app_registers_cleanup_hook():
 
 @pytest.mark.asyncio
 async def test_startup_calls_pool_start_all():
-    """on_startup hook must call pool.start_all()."""
+    """on_startup hook must schedule pool.start_all() without blocking startup."""
     mock_pool = MagicMock()
     mock_pool.start_all = AsyncMock()
     mock_pool.stop_all = AsyncMock()
 
-    with patch("cato.orchestrator.cli_process_pool.get_pool", return_value=mock_pool):
+    async def no_sleep(_seconds):
+        return None
+
+    with patch("cato.orchestrator.cli_process_pool.get_pool", return_value=mock_pool), \
+         patch("cato.ui.server.asyncio.sleep", side_effect=no_sleep):
         app = await create_ui_app()
         # Run all startup signals manually
         for hook in app.on_startup:
             await hook(app)
+        await _cli_pool_startup_task(app)
 
     mock_pool.start_all.assert_awaited_once()
 
@@ -100,11 +118,16 @@ async def test_startup_failure_does_not_raise():
     mock_pool.start_all = AsyncMock(side_effect=RuntimeError("pool boom"))
     mock_pool.stop_all = AsyncMock()
 
-    with patch("cato.orchestrator.cli_process_pool.get_pool", return_value=mock_pool):
+    async def no_sleep(_seconds):
+        return None
+
+    with patch("cato.orchestrator.cli_process_pool.get_pool", return_value=mock_pool), \
+         patch("cato.ui.server.asyncio.sleep", side_effect=no_sleep):
         app = await create_ui_app()
         # Must not raise
         for hook in app.on_startup:
             await hook(app)
+        await _cli_pool_startup_task(app)
 
 
 @pytest.mark.asyncio
@@ -187,7 +210,7 @@ async def test_config_post_returns_ok():
     app = await create_ui_app()
 
     async with TestClient(TestServer(app)) as client:
-        resp = await client.post("/config", json={"theme": "dark"})
+        resp = await client.post("/config", json={"theme": "dark"}, headers=_auth_headers())
         assert resp.status == 200
         data = await resp.json()
         assert data["status"] == "ok"
@@ -202,7 +225,7 @@ async def test_config_post_invalid_json_returns_400():
         resp = await client.post(
             "/config",
             data="not valid json",
-            headers={"Content-Type": "application/json"},
+            headers=_auth_headers({"Content-Type": "application/json"}),
         )
         assert resp.status == 400
 

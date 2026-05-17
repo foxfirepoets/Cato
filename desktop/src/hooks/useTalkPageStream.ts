@@ -44,6 +44,7 @@ const TASK_TIMEOUT_MS      = 5_000;
 export function useTalkPageStream(
   taskId: string,
   wsBase?: string,
+  daemonToken?: string,
 ): UseTalkPageStreamResult {
   const [messages,         setMessages]         = useState<TalkMessage[]>([]);
   const [isLoading,        setIsLoading]        = useState<boolean>(true);
@@ -229,7 +230,9 @@ export function useTalkPageStream(
     // KRAK-4: validate wsBase is localhost-only — desktop app never connects to external hosts
     const rawHost = wsBase ?? "127.0.0.1:8080";
     const host = /^127\.0\.0\.1:\d+$/.test(rawHost) ? rawHost : "127.0.0.1:8080";
-    const url  = `ws://${host}/ws/coding-agent/${encodeURIComponent(taskId)}`;
+    const token = daemonToken || (window as Window & { __CATO_DAEMON_TOKEN__?: string }).__CATO_DAEMON_TOKEN__;
+    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+    const url  = `ws://${host}/ws/coding-agent/${encodeURIComponent(taskId)}${qs}`;
 
     setConnectionStatus("connecting");
     const ws = new WebSocket(url);
@@ -271,7 +274,7 @@ export function useTalkPageStream(
       }
     };
   }, [
-    taskId, wsBase, handleMessage, resetHeartbeatTimer,
+    taskId, wsBase, daemonToken, handleMessage, resetHeartbeatTimer,
     clearHeartbeatTimer, startTaskTimeout,
   ]);
 

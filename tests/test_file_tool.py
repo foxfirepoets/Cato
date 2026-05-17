@@ -2,7 +2,6 @@
 import json
 import pytest
 import asyncio
-import cato.tools.file as ft
 from cato.tools.file import FileTool
 
 
@@ -17,7 +16,12 @@ async def test_path_traversal_blocked(tmp_path):
 
 @pytest.mark.asyncio
 async def test_valid_read_write(tmp_path, monkeypatch):
-    monkeypatch.setattr(ft, "_WORKSPACE_ROOT", tmp_path)
+    # BH-010 — the file tool no longer exposes a `_WORKSPACE_ROOT` module
+    # constant; it reads `CATO_WORKSPACE_DIR` at call time via the
+    # `_workspace_root()` helper.  Monkeypatch the env var so the tool
+    # writes into the pytest tmp_path instead of the operator's real
+    # workspace.
+    monkeypatch.setenv("CATO_WORKSPACE_DIR", str(tmp_path))
     tool = FileTool()
     # Write then read
     write_raw = await tool.execute({"action": "write", "path": "test.txt", "content": "hello", "agent_id": "test"})
@@ -26,3 +30,9 @@ async def test_valid_read_write(tmp_path, monkeypatch):
     read_raw = await tool.execute({"action": "read", "path": "test.txt", "agent_id": "test"})
     read_result = json.loads(read_raw)
     assert "hello" in read_result.get("content", "")
+    # Also verify the file actually landed under tmp_path/main/, proving the
+    # env-var bridge worked (regression lock against the BH-010 fix being
+    # undone in the future).
+    written_file = tmp_path / "test" / "test.txt"
+    assert written_file.exists(), f"expected file at {written_file}"
+    assert written_file.read_text(encoding="utf-8") == "hello"

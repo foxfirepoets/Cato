@@ -3,11 +3,24 @@ from __future__ import annotations
 import socket
 from types import SimpleNamespace
 
-import pytest
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+import importlib
 
-from cato.mcp import CatoMCPRuntime
+import pytest
+
+# The local mcp/ package shadows the MCP SDK — import SDK symbols lazily
+# so test collection never triggers the circular import in mcp/runtime.py.
+try:
+    _mcp_sdk = importlib.import_module("mcp")
+    _mcp_http = importlib.import_module("mcp.client.streamable_http")
+    ClientSession = _mcp_sdk.ClientSession
+    streamablehttp_client = _mcp_http.streamablehttp_client
+    _MCP_AVAILABLE = True
+except Exception:
+    _MCP_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(not _MCP_AVAILABLE, reason="MCP SDK not importable (shadowed by local mcp/ package)")
+
+from cato.mcp import CatoMCPRuntime  # noqa: E402
 
 
 def _free_port() -> int:

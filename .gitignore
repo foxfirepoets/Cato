@@ -87,3 +87,59 @@ desktop/src-tauri/binaries/
 # Ralph Loop state directories
 Ralph Loop Desktop APP/
 Ralph Loop Web UI/
+
+# --- Added: keep-out categories from untracked audit ---
+
+# Local logs and test outputs (root-level scratch)
+/build_log*.txt
+/cargo_log.txt
+/daemon_err.txt
+/full_test*.txt
+/tauri_build.txt
+/test_err*.txt
+/test_errors.txt
+/test_out*.txt
+/test_output.txt
+/t2.txt
+/t2e.txt
+/t3.txt
+/null
+/live_*_results.json
+
+# Editor backups
+*.bak
+
+# Debug / scratch Python at repo root
+/cato_debug*.py
+/cato_test*.py
+/cato_time_test.py
+/cato_e2e_sentinel.py
+/diagnose*.py
+/live_browser_validation.py
+/live_conduit_test.py
+/ws_debug*.py
+/ws_test.py
+
+# Personal / internal docs (root-anchored to avoid tracked workspace/ copies)
+/AGENTS.md
+/IDENTITY.md
+/SOUL.md
+HKO_CERTIFICATE_*.md
+HKO_TRUTH_AUDIT_*.md
+TRUTH_AUDIT_*.md
+
+# Brainstorm and strategy folders
+Brainstorm Cato/
+Empire Builder/
+
+# Old project snapshots (large, may contain stale secrets)
+Various Cato/
+
+# Cato runtime identity files
+workspace_files/
+
+# Machine-specific launchers
+/Launch-CatoDesktop.ps1
+
+# Audit reports (judgment-call group)
+final-outcome-audit-reports/

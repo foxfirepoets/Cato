@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -47,7 +48,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp);
 _SENSITIVE_KEYS = frozenset({
     "api_key", "token", "password", "secret", "key", "authorization",
     "bearer", "credential", "passwd", "passphrase",
+    "auth", "x-api-key", "bearer_token", "access_token", "refresh_token",
 })
+
+_SENSITIVE_VALUE_PREFIXES = ("sk-", "Bearer ", "ghp_", "xoxb-", "xoxp-", "ya29.", "AKIA")
 
 _MAX_OUTPUT_CHARS = 2000
 
@@ -62,7 +66,9 @@ def _sanitize_inputs(inputs: dict) -> dict:
         return {}
     clean: dict = {}
     for k, v in inputs.items():
-        if any(s in k.lower() for s in _SENSITIVE_KEYS):
+        key_sensitive = any(s in k.lower() for s in _SENSITIVE_KEYS)
+        val_sensitive = isinstance(v, str) and any(v.startswith(p) for p in _SENSITIVE_VALUE_PREFIXES)
+        if key_sensitive or val_sensitive:
             clean[k] = "[REDACTED]"
         else:
             clean[k] = v
@@ -120,6 +126,7 @@ class AuditLog:
         from ..platform import get_data_dir
         self._db_path = db_path or (get_data_dir() / "cato.db")
         self._conn: Optional[sqlite3.Connection] = None
+        self._write_lock = threading.Lock()
 
     def connect(self) -> None:
         """Open (or create) the SQLite database and apply the schema."""
@@ -174,32 +181,33 @@ class AuditLog:
         )
         outputs_json = _truncate(raw_output)
 
-        prev_hash = self._last_row_hash(session_id)
+        with self._write_lock:
+            prev_hash = self._last_row_hash(session_id)
 
-        # We need the id first — insert a placeholder then update the hash
-        cur = self._conn.execute(
-            """
-            INSERT INTO audit_log
-              (session_id, action_type, tool_name, inputs_json, outputs_json,
-               cost_cents, error, timestamp, prev_hash, row_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                session_id, action_type, tool_name, inputs_json, outputs_json,
-                cost_cents, error, ts, prev_hash, "",
-            ),
-        )
-        row_id = cur.lastrowid
-        assert row_id is not None
+            # We need the id first — insert a placeholder then update the hash
+            cur = self._conn.execute(
+                """
+                INSERT INTO audit_log
+                  (session_id, action_type, tool_name, inputs_json, outputs_json,
+                   cost_cents, error, timestamp, prev_hash, row_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id, action_type, tool_name, inputs_json, outputs_json,
+                    cost_cents, error, ts, prev_hash, "",
+                ),
+            )
+            row_id = cur.lastrowid
+            assert row_id is not None
 
-        rh = _row_hash(
-            row_id, session_id, action_type, tool_name, cost_cents, ts, prev_hash
-        )
-        self._conn.execute(
-            "UPDATE audit_log SET row_hash = ? WHERE id = ?",
-            (rh, row_id),
-        )
-        self._conn.commit()
+            rh = _row_hash(
+                row_id, session_id, action_type, tool_name, cost_cents, ts, prev_hash
+            )
+            self._conn.execute(
+                "UPDATE audit_log SET row_hash = ? WHERE id = ?",
+                (rh, row_id),
+            )
+            self._conn.commit()
         return row_id
 
     def session_summary(self, session_id: str) -> dict:
@@ -317,6 +325,26 @@ class AuditLog:
                 ok = False
 
         return ok
+
+    def verify_recent_sessions(self, hours: int = 24) -> None:
+        """
+        Verify the hash chain for every session active in the last *hours* hours.
+
+        Logs CRITICAL for any session whose chain is broken.
+        """
+        self._ensure_connected()
+        assert self._conn is not None
+        cutoff = time.time() - hours * 3600
+        rows = self._conn.execute(
+            "SELECT DISTINCT session_id FROM audit_log WHERE timestamp >= ?",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            sid = row["session_id"]
+            if not self.verify_chain(sid):
+                logger.critical(
+                    "AuditLog: chain integrity FAILED for session %s", sid
+                )
 
     def get_session_rows(self, session_id: str) -> list[dict]:
         """

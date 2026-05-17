@@ -59,12 +59,20 @@ def test_catalog_status_metadata_redacts_secret_values(monkeypatch: pytest.Monke
     assert status["metadata"]["required_vault_keys"] == ["SWARMSYNC_API_KEY"]
 
 
-def test_config_values_with_secret_like_names_are_redacted() -> None:
-    assert integration_routes._safe_config_value("plain-value") == "plain-value"
-    assert integration_routes._safe_config_value("contains-api_key-value") == "[redacted]"
-    assert integration_routes._safe_config_value("contains-token-value") == "[redacted]"
-    assert integration_routes._safe_config_value("contains-secret-value") == "[redacted]"
-    assert integration_routes._safe_config_value("contains-password-value") == "[redacted]"
+def test_sensitive_config_keys_are_redacted_by_name() -> None:
+    assert integration_routes._is_sensitive_key("github_token") is True
+    assert integration_routes._is_sensitive_key("stripe_secret") is True
+    assert integration_routes._is_sensitive_key("vault_password") is True
+    assert integration_routes._is_sensitive_key("openrouter_api_key") is True
+    assert integration_routes._is_sensitive_key("workspace_dir") is False
+
+    class _Cfg:
+        github_token = "ghp_realtokenvaluewithoutkeyword12345"
+        workspace_dir = "/tmp/work"
+
+    subset = integration_routes._config_subset(_Cfg(), ("github_token", "workspace_dir"))
+    assert subset["github_token"] == "[redacted]"
+    assert subset["workspace_dir"] == "/tmp/work"
 
 
 def test_vault_presence_marks_secret_configured_without_exposing_value(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -154,10 +154,16 @@ def _load_vault_keys() -> tuple[set[str], str]:
         return set(), "unavailable"
 
 
+_SENSITIVE_KEY_PARTS = ("token", "secret", "password", "api_key", "key")
+
+
+def _is_sensitive_key(name: str) -> bool:
+    lowered = name.lower()
+    return any(part in lowered for part in _SENSITIVE_KEY_PARTS)
+
+
 def _safe_config_value(value: Any) -> Any:
-    """Return config metadata values, redacting fields that should never echo secrets."""
-    if isinstance(value, str) and any(token in value.lower() for token in ("token", "secret", "password", "api_key")):
-        return "[redacted]"
+    """Coerce config metadata to JSON-safe primitives. Redaction is keyed by field name in _config_subset."""
     if isinstance(value, (str, bool, int, float, list)) or value is None:
         return value
     return str(value)
@@ -165,7 +171,7 @@ def _safe_config_value(value: Any) -> Any:
 
 def _config_subset(cfg: CatoConfig, keys: tuple[str, ...]) -> dict[str, Any]:
     return {
-        key: _safe_config_value(getattr(cfg, key))
+        key: "[redacted]" if _is_sensitive_key(key) else _safe_config_value(getattr(cfg, key))
         for key in keys
         if hasattr(cfg, key)
     }
@@ -305,7 +311,7 @@ async def integration_action(request: web.Request) -> web.Response:
 
     dry_run = _as_bool(body.get("dry_run", True), default=True)
     approved = _as_bool(body.get("approved", False), default=False)
-    timeout = float(body.get("timeout", 20.0))
+    timeout = max(1.0, min(float(body.get("timeout", 20.0)), 60.0))
     result = await _runtime().action(
         integration_id,
         action_name,

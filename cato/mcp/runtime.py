@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from typing import Any
 from uuid import uuid4
 
 import uvicorn
-from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
+
+# Lock to prevent concurrent sys.path mutations during MCP server initialization
+_SYS_PATH_LOCK = threading.Lock()
 
 
 def _adapter_status(gateway: Any) -> list[dict[str, Any]]:
@@ -47,8 +50,33 @@ def _history_for_session(gateway: Any, session_id: str, limit: int) -> list[dict
     return history[-limit:]
 
 
-def create_mcp_server(gateway: Any, config: Any) -> FastMCP:
+def create_mcp_server(gateway: Any, config: Any) -> Any:
     """Create the FastMCP server that fronts the running Cato gateway."""
+    import sys, importlib
+    # The project root has a local `mcp/` directory that shadows the installed
+    # mcp SDK package. Remove the project root from sys.path temporarily so
+    # importlib finds the installed package, not the local folder.
+    import os as _os
+    _cato_root = str(__file__.split("cato")[0].rstrip("/\\"))
+    with _SYS_PATH_LOCK:
+        # Remove all entries that resolve to the Cato project root (including '' for cwd)
+        _shadow_roots = {_cato_root, ""}
+        _removed: list[tuple[int, str]] = [
+            (i, p) for i, p in enumerate(sys.path)
+            if p in _shadow_roots or (_os.path.isabs(p) and _os.path.normcase(p) == _os.path.normcase(_cato_root))
+        ]
+        for i, _ in sorted(_removed, reverse=True):
+            sys.path.pop(i)
+        # Invalidate any cached local mcp module
+        for _k in list(sys.modules.keys()):
+            if _k == "mcp" or _k.startswith("mcp."):
+                del sys.modules[_k]
+        try:
+            _sdk_mcp = importlib.import_module("mcp.server.fastmcp")
+        finally:
+            for i, p in sorted(_removed):
+                sys.path.insert(i, p)
+    FastMCP = _sdk_mcp.FastMCP
     mount_path = getattr(config, "mcp_mount_path", "/mcp") or "/mcp"
     server = FastMCP(
         name="Cato",

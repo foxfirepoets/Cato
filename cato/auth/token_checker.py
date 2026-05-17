@@ -11,21 +11,79 @@ from typing import Any, Optional
 from .token_store import TokenStore, ACTION_CATEGORIES
 
 # Tool-name → action category mapping (extends reversibility registry)
+_DEFAULT_ALLOWED_TOOLS = frozenset({
+    # Read-only / informational — always safe
+    "get_time", "read_file", "list_files", "get_config",
+    "memory_search", "memory_read",
+    # Dotted equivalents used by internal tool registry
+    "memory.search", "memory.federated",
+    "graph.query", "graph.related",
+    # File operations (agent needs these for basic functionality)
+    "file", "write_file", "edit_file",
+    # Web / search / research (read-only extraction)
+    "web_search", "web.search", "web.code", "web.news",
+    "academic.arxiv", "academic.semantic_scholar", "academic.pubmed",
+    # Conduit browser (navigation + extraction)
+    "conduit_navigate", "conduit_extract", "conduit_click", "conduit_type",
+    "conduit.crawl", "conduit.monitor",
+    "browser",
+    # Code execution (sandboxed)
+    "python.execute", "shell_execute", "shell.exec", "shell",
+    # GitHub (read + write)
+    "github.issue_list", "github.pr_list",
+    "github.pr_review", "github.issue_create",
+    "git_commit", "git_push",
+    # Flows
+    "flow.run",
+})
+
 _TOOL_CATEGORY_MAP: dict[str, str] = {
+    # Conduit browser tools
     "conduit_navigate": "web.navigate",
     "conduit_extract":  "web.extract",
     "conduit_click":    "web.navigate",
     "conduit_type":     "web.navigate",
-    "web_search":       "web.extract",
+    "conduit.crawl":    "web.extract",
+    "conduit.monitor":  "web.extract",
+    # Web search / research
+    "web_search":           "web.extract",
+    "web.search":           "web.extract",
+    "web.code":             "web.extract",
+    "web.news":             "web.extract",
+    "academic.arxiv":       "web.extract",
+    "academic.semantic_scholar": "web.extract",
+    "academic.pubmed":      "web.extract",
+    # File operations
+    "file":             "file.read",
     "read_file":        "file.read",
     "write_file":       "file.write",
     "edit_file":        "file.write",
     "delete_file":      "file.delete",
+    # Browser
+    "browser":          "web.navigate",
+    # Memory
+    "memory.search":    "file.read",
+    "memory.federated": "file.read",
+    # Flows
+    "flow.run":         "shell.execute",
+    # Knowledge graph
+    "graph.query":      "file.read",
+    "graph.related":    "file.read",
+    # GitHub
+    "github.pr_review":    "git.write",
+    "github.issue_create": "git.write",
+    "github.issue_list":   "file.read",
+    "github.pr_list":      "file.read",
+    # Execution
     "git_commit":       "git.write",
     "git_push":         "git.write",
     "email_send":       "email.send",
     "api_payment":      "payment.*",
     "shell_execute":    "shell.execute",
+    "shell.exec":       "shell.execute",
+    "shell":            "shell.execute",
+    "python.execute":   "shell.execute",
+    "python":           "shell.execute",
 }
 
 
@@ -59,24 +117,30 @@ class TokenChecker:
 
         category = _TOOL_CATEGORY_MAP.get(tool_name)
         if category is None:
-            # Unknown tool category — allow but note
             return AuthResult(
-                authorized=True,
+                authorized=False,
                 token_id=None,
                 reason=(
                     f"Tool '{tool_name}' has no mapped category; "
-                    "proceeding without token check."
+                    "user confirmation required before executing unmapped tools."
                 ),
-                requires_user_confirmation=False,
+                requires_user_confirmation=True,
             )
 
         active_tokens = self._store.list_active()
         if not active_tokens:
+            if tool_name in _DEFAULT_ALLOWED_TOOLS:
+                return AuthResult(
+                    authorized=True,
+                    token_id=None,
+                    reason="No active delegation tokens; tool is in default-allowed list.",
+                    requires_user_confirmation=False,
+                )
             return AuthResult(
-                authorized=True,
+                authorized=False,
                 token_id=None,
-                reason="No active delegation tokens; proceeding in default mode.",
-                requires_user_confirmation=False,
+                reason="No active delegation tokens; tool requires explicit delegation.",
+                requires_user_confirmation=True,
             )
 
         for token in active_tokens:

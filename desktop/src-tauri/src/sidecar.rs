@@ -1,14 +1,20 @@
 //! Sidecar management for the Cato Python daemon.
 //!
-//! Spawns `cato start --channel webchat` as a child process and monitors its health.
+//! Spawns `python -m cato start --channel webchat` as a child process and monitors its health.
+//! Override the interpreter with `CATO_PYTHON` (defaults to `python` on Windows, `python3` elsewhere).
 //! Gracefully shuts down on app exit.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, Duration};
+
+#[cfg(windows)]
+const DEFAULT_PYTHON: &str = "python";
+#[cfg(not(windows))]
+const DEFAULT_PYTHON: &str = "python3";
 
 /// Manages the Cato daemon sidecar process.
 pub struct SidecarManager {
@@ -34,6 +40,14 @@ impl SidecarManager {
         self.ws_port
     }
 
+    pub fn daemon_token() -> Option<String> {
+        let token_path = Self::cato_data_dir()?.join("daemon.token");
+        std::fs::read_to_string(token_path)
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
     /// Check if the daemon is running — either as a child process we spawned,
     /// or as an externally-started daemon already listening on the HTTP port.
     ///
@@ -50,7 +64,7 @@ impl SidecarManager {
                     // Process has exited — clean up and fall through to HTTP check
                     self.child = None;
                 }
-                Ok(None) => return true,   // Our child is still alive
+                Ok(None) => return self.check_http_health().await,
                 Err(_) => {
                     self.child = None;
                 }
@@ -74,30 +88,31 @@ impl SidecarManager {
         )
     }
 
-    /// Start the Cato daemon as a child process.
-    ///
-    /// Tries the bundled sidecar binary first, falls back to system `cato`.
+    /// Start the Cato daemon as a child process (`python -m cato start --channel webchat`).
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Check if already running (handle crashed state)
         if self.is_running().await {
             return Ok(());
         }
 
-        let cato_bin = Self::find_cato_binary();
+        let python_exe = Self::python_executable();
         let sidecar_env = Self::load_env_file();
 
-        // Clear any stale PID file by running `cato stop` first (ignores errors)
+        // Clear any stale PID file by running `python -m cato stop` first (ignores errors)
         log::info!("Clearing any stale Cato daemon state...");
-        let _ = Command::new(&cato_bin).args(["stop"]).output().await;
+        let _ = Command::new(&python_exe)
+            .args(["-m", "cato", "stop"])
+            .output()
+            .await;
         sleep(Duration::from_millis(500)).await;
 
         log::info!(
-            "Starting Cato daemon: {} start --channel webchat",
-            cato_bin.display()
+            "Starting Cato daemon: {} -m cato start --channel webchat",
+            python_exe.display()
         );
 
-        let mut cmd = Command::new(&cato_bin);
-        cmd.args(["start", "--channel", "webchat"])
+        let mut cmd = Command::new(&python_exe);
+        cmd.args(["-m", "cato", "start", "--channel", "webchat"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -109,7 +124,11 @@ impl SidecarManager {
         }
 
         let mut child = cmd.spawn().map_err(|e| {
-            format!("Failed to spawn Cato daemon ({}): {}", cato_bin.display(), e)
+            format!(
+                "Failed to spawn Cato daemon ({} -m cato …): {}",
+                python_exe.display(),
+                e
+            )
         })?;
 
         if let Some(stdout) = child.stdout.take() {
@@ -121,8 +140,9 @@ impl SidecarManager {
 
         self.child = Some(child);
 
-        // Wait for the daemon to become healthy (up to 30 seconds)
-        self.wait_for_health(30).await?;
+        // Wait for the daemon to become healthy. Cold Python starts can take
+        // longer on Windows when optional ML/MCP modules are imported.
+        self.wait_for_health(120).await?;
 
         log::info!("Cato daemon is healthy on port {}", self.http_port);
         Ok(())
@@ -133,10 +153,10 @@ impl SidecarManager {
         if let Some(mut child) = self.child.take() {
             log::info!("Stopping Cato daemon...");
 
-            // Try graceful shutdown via `cato stop`
-            let cato_bin = Self::find_cato_binary();
-            let _ = Command::new(&cato_bin)
-                .args(["stop"])
+            // Try graceful shutdown via `python -m cato stop`
+            let python_exe = Self::python_executable();
+            let _ = Command::new(&python_exe)
+                .args(["-m", "cato", "stop"])
                 .output()
                 .await;
 
@@ -328,149 +348,16 @@ impl SidecarManager {
         }
     }
 
-    fn platform_binary_path(base: PathBuf) -> PathBuf {
-        #[cfg(windows)]
-        {
-            if base.extension().is_none() {
-                let mut path = base;
-                path.set_extension("exe");
-                return path;
+    /// Python interpreter for `python -m cato …`. Set `CATO_PYTHON` to an absolute path if needed.
+    fn python_executable() -> PathBuf {
+        if let Ok(path) = std::env::var("CATO_PYTHON") {
+            let p = PathBuf::from(path.trim());
+            if !p.as_os_str().is_empty() {
+                log::info!("Using Python from CATO_PYTHON: {}", p.display());
+                return p;
             }
         }
-
-        #[cfg(not(windows))]
-        {
-            if base.extension().is_some_and(|ext| ext == "exe") {
-                let mut path = base;
-                path.set_extension("");
-                return path;
-            }
-        }
-
-        base
-    }
-
-    fn is_placeholder_sidecar(path: &Path) -> bool {
-        let Ok(metadata) = std::fs::metadata(path) else {
-            return false;
-        };
-
-        if metadata.len() > 512 {
-            return false;
-        }
-
-        let Ok(contents) = std::fs::read(path) else {
-            return false;
-        };
-
-        contents.starts_with(b"placeholder sidecar stub;")
-    }
-
-    fn dev_sidecar_candidates(base_dir: &Path) -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-
-        let target = std::env::var("TARGET").ok();
-        let mut triple = target.unwrap_or_else(|| {
-            #[cfg(target_os = "windows")]
-            let suffix = "pc-windows-msvc";
-            #[cfg(target_os = "macos")]
-            let suffix = "apple-darwin";
-            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-            let suffix = "unknown-linux-gnu";
-
-            #[cfg(target_arch = "x86_64")]
-            let arch = "x86_64";
-            #[cfg(target_arch = "aarch64")]
-            let arch = "aarch64";
-
-            format!("{arch}-{suffix}")
-        });
-
-        if cfg!(windows) && !triple.ends_with(".exe") {
-            triple.push_str(".exe");
-        }
-
-        // Development launches often run directly from target/release, while the
-        // staged sidecar still lives under src-tauri/binaries.
-        let dev_binary = base_dir
-            .parent()
-            .and_then(|dir| dir.parent())
-            .map(|dir| dir.join("binaries").join(format!("cato-{triple}")));
-
-        if let Some(path) = dev_binary {
-            candidates.push(path);
-        }
-
-        candidates
-    }
-
-    fn path_lookup_binary() -> Option<PathBuf> {
-        #[cfg(windows)]
-        let resolver = "where";
-        #[cfg(not(windows))]
-        let resolver = "which";
-
-        let output = std::process::Command::new(resolver)
-            .arg("cato")
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-    }
-
-    /// Find the cato binary — env override → bundled sidecar → PATH (dev only).
-    fn find_cato_binary() -> PathBuf {
-        if let Ok(path) = std::env::var("CATO_SIDECAR_PATH") {
-            let override_path = PathBuf::from(path);
-            if override_path.exists() {
-                log::info!(
-                    "Using Cato sidecar from CATO_SIDECAR_PATH: {}",
-                    override_path.display()
-                );
-                return override_path;
-            }
-            log::warn!(
-                "CATO_SIDECAR_PATH points to a missing file: {}",
-                override_path.display()
-            );
-        }
-
-        if let Some(base_dir) = Self::current_exe_base_dir() {
-            let bundled = Self::platform_binary_path(base_dir.join("binaries").join("cato"));
-            if bundled.exists() {
-                return bundled;
-            }
-
-            let adjacent = Self::platform_binary_path(base_dir.join("cato"));
-            if adjacent.exists() && !Self::is_placeholder_sidecar(&adjacent) {
-                return adjacent;
-            }
-
-            for candidate in Self::dev_sidecar_candidates(&base_dir) {
-                if candidate.exists() && !Self::is_placeholder_sidecar(&candidate) {
-                    log::info!("Using development sidecar: {}", candidate.display());
-                    return candidate;
-                }
-            }
-        }
-
-        if let Some(path) = Self::path_lookup_binary() {
-            log::info!("Resolved cato via PATH: {}", path.display());
-            return path;
-        }
-
-        log::warn!("cato binary not bundled; falling back to bare 'cato' for development");
-        Path::new("cato").to_path_buf()
+        PathBuf::from(DEFAULT_PYTHON)
     }
 }
 

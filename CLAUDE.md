@@ -1,52 +1,37 @@
 # CATO — MANDATORY DEVELOPMENT RULES
 
+## ⚠️ ROUTING — READ THIS FIRST, EVERY TIME
+
+**Cato routes ALL LLM calls through SwarmSync. Full stop.**
+
+- `swarmsync_enabled: true` in config.yaml — DO NOT change this
+- `SWARMSYNC_API_KEY` is in the root `.env` file AND in the vault
+- SwarmSync picks the best model per call — Cato does NOT call OpenRouter directly
+- **NEVER assume Cato is broken because of a missing OpenRouter/MiniMax/Anthropic key**
+- If Cato returns empty responses, check SwarmSync connectivity first
+- The default model (`openrouter/minimax/minimax-m2.5`) is only a fallback slug — SwarmSync overrides it
+
+---
+
 ## AUDIT GATE: NOTHING GETS PUSHED TO GITHUB WITHOUT PASSING THIS PIPELINE
 
-Every change — no matter how small — must pass through the full audit pipeline before any `git push`:
+Every change — no matter how small — must pass through the audit pipeline before any `git push`:
 
 ```
 CODE COMPLETE
      |
      v
-[1] ALEX AGENT — Audit & Test
-     - Full code review of all changed files
-     - Run complete test suite (must be 100% passing — no exceptions)
-     - Identify and fix all issues found
-     - Produce audit report: CATO_ALEX_AUDIT.md
-     - Status must be: APPROVED
-     |
-     v
-[2] KRAKEN AGENT — Verification & Reality Check
-     - Verify Alex's audit is authentic and complete
+
+[1] /HKO-truth-audit — Verification & Reality Check
+     - Verify authentic and complete
      - Independently verify test results
      - Implement any additional fixes Kraken deems necessary
-     - Produce verdict: CATO_KRAKEN_VERDICT.md
-     - Status must be: APPROVED
+     
      |
      v
-[3] GIT PUSH — Only after both agents approve
+[2] GIT PUSH — Only after both agents approve
 ```
 
-## THE THREE LAWS
-
-1. **100% test pass rate** — no exceptions, ever. One failing test = do not push.
-2. **Alex audits first** — always. No skipping, no "it's a small change."
-3. **Kraken verifies second** — always. Kraken's verdict is final.
-
-## AUDIT AGENT DETAILS
-
-### Alex (Audit & Test Agent)
-- Performs full code review of all changed files
-- Runs `pytest` — must see 100% pass before approving
-- Fixes bugs found during review
-- Writes `CATO_ALEX_AUDIT.md` with findings, fixes, and APPROVED/REJECTED status
-
-### Kraken (Verification Agent)
-- Reviews Alex's audit report for completeness and authenticity
-- Re-runs tests independently to confirm results
-- Applies any additional fixes Kraken identifies
-- Writes `CATO_KRAKEN_VERDICT.md` with final GO/NO-GO decision
-- Kraken's GO is the only authorization to push
 
 ## WHAT THIS APPLIES TO
 
@@ -107,14 +92,16 @@ cato/                  Python daemon source
   adapters/
     telegram.py        Telegram long-polling adapter
   cli.py               Main Click CLI
-  agent_loop.py        Core agent loop + register_all_tools
-  gateway.py           Message routing hub — WebSocket broadcast + adapter delivery
+  agent_loop.py        Core agent loop + tool registry (file, browser, shell, github, conduit, memory, graph, web_search, python, clawflows)
+  gateway.py           Message routing hub — WebSocket broadcast + adapter delivery + activity indicator
   vault.py             AES-256-GCM vault
   budget.py            Hard spend caps
 desktop/               Tauri v2 desktop app
   src/                 React/TypeScript frontend
     hooks/
       useChatStream.ts WebSocket hook — handles web + Telegram messages, 5s history poll
+    components/
+      ActivityIndicator.tsx  Real-time busy/idle pill (polls /api/activity + WS events)
     views/
       ChatView.tsx     Main chat interface
       SettingsView.tsx Settings tabs (general/memory/channels/scheduling/workspace)
@@ -130,9 +117,10 @@ tests/                 pytest test suite (1346+ tests, must stay 100%)
 - Build script: `desktop/build_release.ps1`
 - Build env: MSVC 14.44.35207 + Windows SDK 10.0.26100.0
 - **Heartbeat timeout**: 45s (server sends every 30s)
-- **CORS**: `cors_middleware` in `cato/ui/server.py` adds `Access-Control-Allow-Origin: *`
+- **CORS**: `cors_middleware` in `cato/ui/server.py` — whitelists `tauri://localhost`, `http://tauri.localhost`, `https://tauri.localhost`, `http://127.0.0.1`, `http://localhost`
 - Coding agent WS is on port 8080 (aiohttp), NOT 8081 (gateway)
 - Logo: `cato-logo.png` (transparent 1024×1024 PNG), 44×44px in sidebar
+- **Activity Indicator**: green "Idle" / amber "Working… <task>" pill in Dashboard + Chat headers. Backend: `gateway._broadcast_activity()` pushes WS events + `GET /api/activity` HTTP polling (token-exempt). Frontend: `ActivityIndicator.tsx` polls every 2s, listens for WS `type: "activity"` events.
 
 ## SKILLS SYSTEM
 
@@ -161,7 +149,7 @@ Fan-out to Claude/Codex/Gemini/Cursor in parallel (60s timeout each):
 
 - pytest asyncio_mode=auto, tests/ directory
 - Coverage via pytest-cov; `norecursedirs` excludes `.claude`, `BRAINSTORM`, `venv`
-- **1346/1346 tests passing** as of 2026-03-09
+- **1705/1705 tests passing** as of 2026-05-13
 
 ## AUDIT REPORT LOCATIONS
 

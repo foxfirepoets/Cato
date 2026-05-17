@@ -3,6 +3,7 @@
  * Polls /health, /api/budget/summary, /api/sessions, /api/usage/summary
  */
 import React, { useState, useEffect, useCallback } from "react";
+import { ActivityIndicator } from "../components/ActivityIndicator";
 
 import type { View } from "../components/Sidebar";
 
@@ -162,6 +163,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ httpPort, onNaviga
     <div className="dash-view">
       <div className="dash-header">
         <h1 className="dash-title">Dashboard</h1>
+        <ActivityIndicator httpPort={httpPort} />
         {error && <span className="dash-error-badge">⚠ {error}</span>}
         <button className="dash-refresh-btn" onClick={fetchAll}>Refresh</button>
       </div>

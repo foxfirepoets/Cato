@@ -98,6 +98,7 @@ class SafetyGuard:
         cfg = config or {}
         self._mode: str = cfg.get("safety_mode", "strict").lower()
         self._stop_file: Path = self._stop_file_path()
+        self._shell_exec_allowed: bool = bool(cfg.get("shell_exec_allowed", False))
 
     @staticmethod
     def _stop_file_path() -> Path:
@@ -139,6 +140,12 @@ class SafetyGuard:
           Default answer is N (safe by default).
         """
         if self._mode == "off":
+            # shell.exec always requires explicit opt-in regardless of safety_mode
+            if tool_name in ("shell", "shell.exec", "shell.run") and not self._shell_exec_allowed:
+                logger.warning(
+                    "shell.exec blocked in safety_mode=off: set shell_exec_allowed=true in config to enable"
+                )
+                return False
             return True
 
         # Emergency stop check

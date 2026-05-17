@@ -119,7 +119,7 @@ def _make_mock_loop() -> AgentLoop:
 
 
 def test_compact_token_threshold():
-    assert COMPACT_TOKEN_THRESHOLD == 2500
+    assert COMPACT_TOKEN_THRESHOLD == 9000
 
 
 def test_compact_turn_threshold():
@@ -229,8 +229,9 @@ async def test_maybe_compact_triggers_on_token_threshold(tmp_path):
     loop = _make_mock_loop()
     tpath = tmp_path / "sess.jsonl"
     # 20 turns (above HISTORY_WINDOW but below COMPACT_TURN_THRESHOLD)
-    # Use very long content to push token count above threshold
-    long_content = "word " * 200  # ~200 words ≈ 200 tokens each
+    # Use very long content to push token count above threshold (9000).
+    # ~500 words ≈ 500 tokens each × 20 turns = ~10,000 tokens > 9000 threshold.
+    long_content = "word " * 500  # ~500 words ≈ 500 tokens each
     turns = _make_turns(20, content=long_content)
     _write_transcript(tpath, turns)
 

@@ -129,7 +129,12 @@ def _allowed_chat_ids_from_env() -> set[int]:
             ids.add(int(value))
         except ValueError:
             logger.warning("Ignoring invalid TELEGRAM_CHAT_ID value: %r", value)
-    return ids or {5846582379}
+    if not ids:
+        raise RuntimeError(
+            "TELEGRAM_CHAT_ID is not set. Refusing to start the Telegram bridge "
+            "without an explicit allowlist — set TELEGRAM_CHAT_ID in your .env."
+        )
+    return ids
 
 
 # Telegram chat IDs allowed to drive this bridge. Chat IDs are identifiers,

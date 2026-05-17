@@ -25,10 +25,12 @@ export interface UseChatStreamResult {
   sendMessage: (text: string) => void;
   isStreaming: boolean;
   clearHistory: () => void;
+  /** Ref to the live WebSocket — pass to ActivityIndicator for instant activity events */
+  wsRef: React.RefObject<WebSocket | null>;
 }
 
-const MAX_RETRIES       = 5;
 const INITIAL_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS     = 30_000;
 const HISTORY_POLL_MS   = 5_000;
 const STORAGE_KEY       = "cato-chat-messages";
 const MAX_STORED        = 500;
@@ -50,7 +52,7 @@ function saveStored(msgs: ChatMessage[]): void {
   }
 }
 
-export function useChatStream(wsBase?: string, httpPort?: number): UseChatStreamResult {
+export function useChatStream(wsBase?: string, httpPort?: number, daemonToken?: string): UseChatStreamResult {
   const [messages, setMessages] = useState<ChatMessage[]>(loadStored);
   const [connectionStatus, setConnectionStatus] = useState<ChatConnectionStatus>("connecting");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -103,7 +105,9 @@ export function useChatStream(wsBase?: string, httpPort?: number): UseChatStream
     const apiBase = httpPort ? `http://127.0.0.1:${httpPort}` : "http://127.0.0.1:8080";
     const poll = async () => {
       try {
-        const res = await fetch(`${apiBase}/api/chat/history?since=${sinceRef.current}`);
+        const token = daemonToken || (window as Window & { __CATO_DAEMON_TOKEN__?: string }).__CATO_DAEMON_TOKEN__;
+        const headers = token ? { "X-Cato-Token": token } : undefined;
+        const res = await fetch(`${apiBase}/api/chat/history?since=${sinceRef.current}`, { headers });
         if (!res.ok) return;
         const entries = await res.json() as Array<{
           id: string; role: string; text: string; channel: string;
@@ -128,12 +132,14 @@ export function useChatStream(wsBase?: string, httpPort?: number): UseChatStream
     const timer = setInterval(poll, HISTORY_POLL_MS);
     poll(); // immediate first fetch
     return () => clearInterval(timer);
-  }, [httpPort, addMessages]);
+  }, [httpPort, daemonToken, addMessages]);
 
   const connect = useCallback(() => {
     const rawHost = wsBase ?? "127.0.0.1:8080";
     const host = /^127\.0\.0\.1:\d+$/.test(rawHost) ? rawHost : "127.0.0.1:8080";
-    const url = `ws://${host}/ws`;
+    const token = daemonToken || (window as Window & { __CATO_DAEMON_TOKEN__?: string }).__CATO_DAEMON_TOKEN__;
+    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+    const url = `ws://${host}/ws${qs}`;
 
     setConnectionStatus("connecting");
     const ws = new WebSocket(url);
@@ -201,16 +207,12 @@ export function useChatStream(wsBase?: string, httpPort?: number): UseChatStream
 
     ws.onclose = () => {
       if (!mountedRef.current) return;
-      if (retriesRef.current < MAX_RETRIES) {
-        const delay = Math.min(INITIAL_BACKOFF_MS * 2 ** retriesRef.current, 16_000);
-        retriesRef.current += 1;
-        setConnectionStatus("reconnecting");
-        setTimeout(connect, delay);
-      } else {
-        setConnectionStatus("disconnected");
-      }
+      retriesRef.current += 1;
+      const backoff = Math.min(INITIAL_BACKOFF_MS * Math.pow(2, retriesRef.current - 1), MAX_BACKOFF_MS);
+      setConnectionStatus("reconnecting");
+      setTimeout(connect, backoff);
     };
-  }, [wsBase, addMessages]);
+  }, [wsBase, daemonToken, addMessages]);
 
   useEffect(() => {
     connect();
@@ -243,7 +245,7 @@ export function useChatStream(wsBase?: string, httpPort?: number): UseChatStream
         type:       "message",
         text,
         session_id: sessionIdRef.current,
-      }) + "\n",
+      }),
     );
   }, [addMessages]);
 
@@ -254,7 +256,7 @@ export function useChatStream(wsBase?: string, httpPort?: number): UseChatStream
     localStorage.removeItem(STORAGE_KEY);
   }, []);
 
-  return { messages, connectionStatus, sendMessage, isStreaming, clearHistory };
+  return { messages, connectionStatus, sendMessage, isStreaming, clearHistory, wsRef };
 }
 
 export default useChatStream;

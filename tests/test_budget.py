@@ -30,6 +30,7 @@ async def test_budget_format_footer(budget):
     assert "$" in footer
 
 
-def test_unknown_model_raises(budget):
-    with pytest.raises(ValueError, match="Unknown model"):
-        asyncio.run(budget.check_and_deduct("unknown-model-xyz", 100, 50))
+def test_unknown_model_uses_fallback(budget):
+    # Unknown models should use conservative fallback pricing, not raise
+    cost = budget.estimate_cost("unknown-model-xyz", 1_000_000, 0)
+    assert cost == pytest.approx(3.00, rel=1e-4)

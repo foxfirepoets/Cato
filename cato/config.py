@@ -7,6 +7,7 @@ First-run detection: returns defaults when the config file does not yet exist.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
@@ -16,6 +17,54 @@ import yaml
 from .platform import get_data_dir
 
 _CONFIG_FILE = get_data_dir() / "config.yaml"
+logger = logging.getLogger(__name__)
+
+
+_TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
+_FALSE_STRINGS = {"0", "false", "no", "n", "off"}
+_NULL_STRINGS = {"null", "none", "~"}
+
+
+def _normalize_config_value(value: Any, default: Any) -> Any:
+    """Coerce legacy YAML string scalars to the type used by the config default."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        lowered = stripped.lower()
+        if lowered in _NULL_STRINGS:
+            return None
+
+        if isinstance(default, bool):
+            if lowered in _TRUE_STRINGS:
+                return True
+            if lowered in _FALSE_STRINGS:
+                return False
+            return value
+
+        if isinstance(default, int) and not isinstance(default, bool):
+            try:
+                return int(stripped)
+            except ValueError:
+                return value
+
+        if isinstance(default, float):
+            try:
+                return float(stripped)
+            except ValueError:
+                return value
+
+        if isinstance(default, list):
+            if lowered in {"", "[]"}:
+                return []
+            if stripped.startswith("["):
+                try:
+                    parsed = yaml.safe_load(stripped)
+                except yaml.YAMLError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return parsed
+            return [item.strip() for item in stripped.split(",") if item.strip()]
+
+    return value
 
 
 @dataclass
@@ -30,11 +79,11 @@ class CatoConfig:
     # Identity
     agent_name: str = "cato"
 
-    # Model selection
-    default_model: str = "claude-sonnet-4-6"
+    # Model selection (fallback slug — SwarmSync overrides this when enabled)
+    default_model: str = "openrouter/minimax/minimax-m2.5"
 
     # SwarmSync intelligent routing
-    swarmsync_enabled: bool = False
+    swarmsync_enabled: bool = True
     swarmsync_api_url: str = "https://api.swarmsync.ai/v1/chat/completions"
 
     # Budget caps (USD)
@@ -59,8 +108,16 @@ class CatoConfig:
     mcp_mount_path: str = "/mcp"
 
     # Planning
-    max_planning_turns: int = 2
+    max_planning_turns: int = 6
     context_budget_tokens: int = 7000
+    max_output_tokens: int = 16384          # max tokens per LLM response
+    # BH-009 — Hard cap on the per-message agent-loop run.  This budget covers
+    # ALL planning turns + LLM round trips + tool executions for a single
+    # inbound message.  When it expires the user sees the "long-running tool
+    # call had to abort after N minutes" fallback.  Default 600s (10 min) is
+    # generous enough for multi-tool plans against a degraded SwarmSync.  Raise
+    # for long-running ops; lower for fast-feedback interactive use.
+    gateway_task_timeout_s: float = 600.0
 
     # Conduit browser engine (opt-in)
     conduit_enabled: bool = False
@@ -124,15 +181,26 @@ class CatoConfig:
             return instance  # first-run defaults
 
         try:
-            raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            raw_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except yaml.YAMLError:
             return instance  # corrupted file — return defaults
+        if not isinstance(raw_data, dict):
+            logger.warning("Ignoring config file with non-mapping root: %s", path)
+            return instance
 
         # Only set fields that are declared on the dataclass
-        valid_names = {f.name for f in fields(cls) if not f.name.startswith("_")}
-        for key, value in raw.items():
-            if key in valid_names:
-                setattr(instance, key, value)
+        field_by_name = {
+            f.name: f
+            for f in fields(cls)
+            if not f.name.startswith("_")
+        }
+        for key, value in raw_data.items():
+            if key == "config" and isinstance(value, dict):
+                logger.warning("Ignoring nested legacy 'config' block in %s", path)
+                continue
+            if key in field_by_name:
+                default = getattr(instance, key)
+                setattr(instance, key, _normalize_config_value(value, default))
 
         return instance
 

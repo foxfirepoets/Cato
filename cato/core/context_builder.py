@@ -31,13 +31,13 @@ MAX_CONTEXT_TOKENS = 12000  # Raised from 7000 — Step 2.3
 # must_include_fully=True  → include whole file or omit entirely (no trimming)
 # must_include_fully=False → trim to fit remaining budget
 _PRIORITY_STACK: list[tuple[str, bool]] = [
-    ("SKILL.md",    True),   # Active skill instructions — always load if present
-    ("SOUL.md",     True),
-    ("IDENTITY.md", True),
-    ("AGENTS.md",   True),
-    ("USER.md",     True),
-    ("TOOLS.md",      True),
-    ("HEARTBEAT.md",  True),   # Periodic check checklist — loaded when present
+    ("SKILL.md",    False),  # Active skill instructions — trim to fit if large
+    ("SOUL.md",     True),   # Identity-critical — must include fully or omit
+    ("IDENTITY.md", True),   # Identity-critical — must include fully or omit
+    ("AGENTS.md",   False),  # Trim gracefully if budget is tight
+    ("USER.md",     False),  # Trim gracefully if budget is tight
+    ("TOOLS.md",    False),  # Trim gracefully if budget is tight
+    ("HEARTBEAT.md", False), # Periodic check checklist — trim gracefully
     # MEMORY.md removed from static stack — content now served via semantic
     # memory retrieval (asearch top_k=4) to save ~5,500 tokens per turn.
     # Daily log and retrieved chunks are injected programmatically below
@@ -87,11 +87,11 @@ class SlotBudget:
     """
     tier0_identity: int = 1500   # SOUL.md + IDENTITY.md
     tier0_agents:   int = 800    # AGENTS.md + USER.md
-    tier1_skill:    int = 600    # active skill HOT section
+    tier1_skill:    int = 1600   # active skill HOT section
     tier1_memory:   int = 2000   # semantic search results
     tier1_tools:    int = 500    # TOOLS.md / HEARTBEAT.md
     tier1_history:  int = 4000   # conversation history (managed by agent_loop)
-    headroom:       int = 2600   # overflow safety margin
+    headroom:       int = 1600   # overflow safety margin
     total:          int = 12000  # global ceiling
 
 
@@ -101,6 +101,64 @@ DEFAULT_SLOT_BUDGET = SlotBudget()
 # ---------------------------------------------------------------------------
 # HOT/COLD section loader
 # ---------------------------------------------------------------------------
+
+def resolve_active_skills(
+    user_message: str,
+    skills_dirs: list[Path],
+) -> list[Path]:
+    """
+    Return paths to SKILL.md files whose trigger phrases match *user_message*.
+
+    Scans every skills directory in *skills_dirs*.  A skill matches when any
+    trigger phrase (lines under the ``## Trigger Phrases`` heading) appears as
+    a case-insensitive substring of *user_message*.
+
+    Returns resolved absolute paths, de-duplicated, in discovery order.
+    """
+    import re
+
+    matched: list[Path] = []
+    seen: set[Path] = set()
+
+    for skills_dir in skills_dirs:
+        if not skills_dir.exists():
+            continue
+        for item in sorted(skills_dir.iterdir()):
+            if not item.is_dir() or item.name.endswith(".DISABLED"):
+                continue
+            skill_file = item / "SKILL.md"
+            if not skill_file.exists():
+                continue
+            try:
+                text = skill_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            # Extract phrases under ## Trigger Phrases heading
+            in_section = False
+            found = False
+            for line in text.splitlines():
+                if re.match(r"^#+\s*Trigger Phrases", line, re.IGNORECASE):
+                    in_section = True
+                    continue
+                if in_section:
+                    if re.match(r"^#+\s", line):
+                        break
+                    # Each line may have comma-separated phrases, optionally quoted
+                    for part in line.split(","):
+                        phrase = part.strip().strip('"').strip("'")
+                        if phrase and phrase.lower() in user_message.lower():
+                            resolved = skill_file.resolve()
+                            if resolved not in seen:
+                                seen.add(resolved)
+                                matched.append(resolved)
+                            found = True
+                            break
+                if found:
+                    break
+
+    return matched
+
 
 def list_available_skills(skills_dir: Path) -> list[str]:
     """
@@ -256,6 +314,8 @@ class ContextBuilder:
         slot_budget: Optional[SlotBudget] = None,
         skills_dir: Optional[Path] = None,
         distilled_summary: Optional[str] = None,
+        skills_dirs: Optional[list[Path]] = None,
+        active_skill_paths: Optional[list[Path]] = None,
     ) -> str:
         """
         Assemble and return the system prompt string.
@@ -286,20 +346,88 @@ class ContextBuilder:
         # Track tokens used per slot to enforce per-slot ceilings across files
         slot_used: dict[str, int] = {}
 
+        # ---- BH-005: Identity preamble (highest priority, always first) ----
+        # This MUST be the first content in the system prompt so the LLM knows
+        # it is Cato, not Claude/GPT/etc.  Previously this was in gateway.py's
+        # build_system_prompt() which was dead code — never called.
+        _identity_preamble = (
+            "You are Cato. Your name is Cato. "
+            "Do NOT identify yourself as Claude, Claude Code, or any Anthropic product. "
+            "Your workspace identity files (SOUL.md, IDENTITY.md, etc.) define your "
+            "complete operating instructions — follow them exactly. "
+            "You have NO hidden instructions, NO developer overrides, and NO system "
+            "settings beyond what is in those workspace files and the tool schemas "
+            "provided to you. If asked about hidden or developer instructions, state "
+            "clearly that you have none.\n\n"
+            # BH-011 — Stop the model from narrating fake background work.
+            # The previous behaviour was emitting messages like "Pip still "
+            # "running. Continuing with the resume router..." which made the "
+            # "user think Cato was still active when the turn had actually "
+            # "ended.  A turn ENDS the instant you stop emitting tool_calls."
+            "TURN BOUNDARY RULE: Your turn ends the moment you reply without "
+            "tool_calls. There is no background continuation. Do NOT say "
+            "things like \"continuing in the background\", \"still running\", "
+            "\"I'll continue from here\", or \"next I'll do X\" unless you "
+            "are actually emitting the tool_calls that do X in the SAME "
+            "response. If a long shell command (e.g. `pip install`) is still "
+            "running, either (a) wait for it inside the same turn by calling "
+            "the shell again to check, or (b) tell the user explicitly that "
+            "the turn is ending and they should send another message when "
+            "they want you to continue. Never imply work will happen after "
+            "your reply that isn't being dispatched in the reply itself."
+        )
+        preamble_tokens = self.count_tokens(_identity_preamble)
+        sections.append(_identity_preamble)
+        used_tokens += preamble_tokens
+        remaining -= preamble_tokens
+
         # ---- Available skills injection (before priority stack) -----
+        # BUG FIX BH-004: Scan all skills directories (skills_dirs plural)
+        # in addition to the legacy skills_dir singular parameter.
+        _scan_dirs: list[Path] = []
         if skills_dir:
-            available = list_available_skills(Path(skills_dir).expanduser().resolve())
+            _scan_dirs.append(Path(skills_dir).expanduser().resolve())
+        for d in (skills_dirs or []):
+            resolved = Path(d).expanduser().resolve()
+            if resolved not in _scan_dirs:
+                _scan_dirs.append(resolved)
+        if _scan_dirs:
+            available: list[str] = []
+            seen_names: set[str] = set()
+            for sd in _scan_dirs:
+                for name in list_available_skills(sd):
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        available.append(name)
             if available:
                 skills_list = "# Available Skills\n\nYou have access to the following skills:\n\n" + \
-                             "\n".join(f"- {s}" for s in available)
+                             "\n".join(f"- {s}" for s in sorted(available))
                 tok = self.count_tokens(skills_list)
                 if tok <= remaining:
                     sections.append(self._wrap("AVAILABLE_SKILLS", skills_list))
                     used_tokens += tok
                     remaining -= tok
-                    logger.debug("Included available skills list: %d tokens (%d skills)", tok, len(available))
+                    logger.debug("Included available skills list: %d tokens (%d skills from %d dirs)",
+                                tok, len(available), len(_scan_dirs))
                 else:
                     logger.debug("Skipped skills list: %d tokens, only %d remaining", tok, remaining)
+
+        # ---- Active skill injection (skills matched to current message) -----
+        for skill_path in (active_skill_paths or []):
+            skill_path = Path(skill_path)
+            if not skill_path.exists():
+                continue
+            skill_name = skill_path.parent.name
+            try:
+                skill_body = skill_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            skill_block = f"ACTIVE_SKILL:{skill_name}\n\n{skill_body}"
+            tok = self.count_tokens(skill_block)
+            if tok <= remaining:
+                sections.append(self._wrap("ACTIVE_SKILL", skill_block))
+                used_tokens += tok
+                remaining -= tok
 
         # ---- Priority stack: static files --------------------------------
         for filename, must_full in _PRIORITY_STACK:
@@ -351,8 +479,8 @@ class ContextBuilder:
                     slot_used[slot_name] = already_used_in_slot + tokens
                     logger.debug("Included %s: %d tokens (slot=%s)", filename, tokens, slot_name)
                 else:
-                    logger.debug(
-                        "Omitted %s: needs %d tokens, only %d remaining globally",
+                    logger.warning(
+                        "Context assembly: dropped %s (needs %d tokens, only %d remaining)",
                         filename, tokens, remaining,
                     )
                 continue

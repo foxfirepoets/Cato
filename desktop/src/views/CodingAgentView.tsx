@@ -16,6 +16,7 @@ import logoSrc from "../assets/cato-logo.png";
 interface CodingAgentViewProps {
   wsBase?: string;
   apiBase?: string;
+  daemonToken?: string;
 }
 
 interface RecentTask {
@@ -117,7 +118,7 @@ const RightSidebar: React.FC<RightSidebarProps> = ({
   );
 };
 
-export const CodingAgentView: React.FC<CodingAgentViewProps> = ({ wsBase, apiBase }) => {
+export const CodingAgentView: React.FC<CodingAgentViewProps> = ({ wsBase, apiBase, daemonToken }) => {
   const [taskId, setTaskId] = useState<string | null>(null);
   const [taskDescription, setTaskDescription] = useState("");
   const [copiedState, setCopiedState] = useState(false);
@@ -125,7 +126,7 @@ export const CodingAgentView: React.FC<CodingAgentViewProps> = ({ wsBase, apiBas
   const [showSettings, setShowSettings] = useState(false);
 
   const { messages, isLoading, synthesis, error, connectionStatus, cancel } =
-    useTalkPageStream(taskId ?? "", wsBase);
+    useTalkPageStream(taskId ?? "", wsBase, daemonToken);
 
   React.useEffect(() => {
     if (!synthesis || !taskDescription || !taskId) return;

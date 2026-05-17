@@ -498,9 +498,11 @@ class TestUIServerIntegration(AioHTTPTestCase):
         assert data["status"] == "ok"
 
     async def test_invoke_endpoint_available(self):
+        from cato.ui.server import _DAEMON_TOKEN
         resp = await self.client.post(
             "/api/coding-agent/invoke",
             json={"task": "Check server integration routing"},
+            headers={"X-Cato-Token": _DAEMON_TOKEN},
         )
         assert resp.status == 200
         data = await resp.json()

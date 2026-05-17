@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import os
 import sys
 import tempfile
 import time
@@ -22,7 +23,25 @@ from typing import Optional
 from ..platform import get_data_dir
 
 _DATA_DIR = get_data_dir()
-SANDBOX_DIR = _DATA_DIR / "workspace" / "sandbox"
+
+
+def _sandbox_dir() -> Path:
+    """Resolve the python-executor sandbox dir, honouring ``CATO_WORKSPACE_DIR``.
+
+    BH-010 — bridge config.yaml's `workspace_dir` here too so the python
+    sandbox lives under the operator's chosen workspace instead of the
+    hard-coded ``~/.cato/workspace/sandbox`` location.
+    """
+    custom = os.environ.get("CATO_WORKSPACE_DIR")
+    if custom:
+        return (Path(custom).expanduser().resolve() / "sandbox")
+    return _DATA_DIR / "workspace" / "sandbox"
+
+
+# Backwards-compatible module-level constant — evaluated at import time so
+# existing callers that imported the symbol directly keep working.  Prefer
+# `_sandbox_dir()` in new code so env-var changes take effect immediately.
+SANDBOX_DIR = _sandbox_dir()
 
 BLOCKED_PATTERNS: list[str] = [
     "os.remove",
@@ -91,7 +110,7 @@ class PythonExecutor:
     """
 
     def __init__(self, sandbox_dir: Optional[Path] = None) -> None:
-        self._sandbox_dir = sandbox_dir or SANDBOX_DIR
+        self._sandbox_dir = sandbox_dir or _sandbox_dir()
         self._sandbox_dir.mkdir(parents=True, exist_ok=True)
         self._artifacts_dir = self._sandbox_dir / "artifacts"
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)

@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from .platform import get_data_dir
 
@@ -146,10 +150,12 @@ class BudgetManager:
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(
             json.dumps(self._state, indent=2, ensure_ascii=True),
             encoding="utf-8",
         )
+        os.replace(tmp, self._path)
 
     # ------------------------------------------------------------------
     # Core API
@@ -163,10 +169,13 @@ class BudgetManager:
     ) -> float:
         """Return estimated USD cost for the given model and token counts."""
         if model not in _PRICING:
-            raise ValueError(
-                f"Unknown model '{model}'. Supported: {sorted(_PRICING)}"
+            logger.warning(
+                "Unknown model '%s' — using conservative fallback pricing ($3.00/$15.00 per M tokens)",
+                model,
             )
-        in_price, out_price = _PRICING[model]
+            in_price, out_price = 3.00, 15.00
+        else:
+            in_price, out_price = _PRICING[model]
         cost = (input_tokens * in_price + output_tokens * out_price) / 1_000_000
         return round(cost, 8)
 

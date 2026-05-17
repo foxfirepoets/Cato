@@ -17,6 +17,7 @@ Commands:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -37,6 +38,38 @@ console = Console()
 _CATO_DIR = get_data_dir()
 _PID_FILE = _CATO_DIR / "cato.pid"
 _PORT_FILE = _CATO_DIR / "cato.port"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True when *pid* currently refers to a live process."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_live_pid() -> int | None:
+    """Read the daemon PID file, removing it when it is invalid or stale."""
+    if not _PID_FILE.exists():
+        return None
+    try:
+        pid = int(_PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        _PID_FILE.unlink(missing_ok=True)
+        _PORT_FILE.unlink(missing_ok=True)
+        return None
+    if not _pid_alive(pid):
+        _PID_FILE.unlink(missing_ok=True)
+        _PORT_FILE.unlink(missing_ok=True)
+        return None
+    return pid
 
 
 def _discover_http_port(config: Optional[CatoConfig] = None) -> int:
@@ -321,8 +354,9 @@ def cmd_start(agent: str, channel: str, browser: str) -> None:
         config.conduit_enabled = True
         safe_print("Conduit browser engine enabled (per-action billing).")
 
-    if _PID_FILE.exists():
-        pid = _PID_FILE.read_text().strip()
+    live_pid = _read_live_pid()
+    if live_pid is not None:
+        pid = str(live_pid)
         safe_print(f"Cato already running (PID {pid}). Use 'cato stop' first.")
         return
 
@@ -332,7 +366,6 @@ def cmd_start(agent: str, channel: str, browser: str) -> None:
     safe_print(f"  Log level: {config.log_level}")
 
     # Write PID file
-    import os
     _PID_FILE.write_text(str(os.getpid()))
 
     # Setup cross-platform signal handlers
@@ -437,20 +470,21 @@ def _run_daemon(config: CatoConfig, agent: str, channel: str) -> None:
 @main.command("stop")
 def cmd_stop() -> None:
     """Stop the running CATO daemon."""
-    if not _PID_FILE.exists():
+    pid = _read_live_pid()
+    if pid is None:
         safe_print("Cato is not running.")
         return
 
-    import os, signal
-    pid_str = _PID_FILE.read_text().strip()
+    import signal
     try:
-        pid = int(pid_str)
         os.kill(pid, signal.SIGTERM)
         _PID_FILE.unlink(missing_ok=True)
+        _PORT_FILE.unlink(missing_ok=True)
         safe_print(f"Cato (PID {pid}) stopped.")
     except (ValueError, ProcessLookupError, OSError) as exc:
-        safe_print(f"Could not stop process {pid_str}: {exc}")
+        safe_print(f"Could not stop process {pid}: {exc}")
         _PID_FILE.unlink(missing_ok=True)
+        _PORT_FILE.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +664,8 @@ def _cmd_doctor_attest() -> None:
 def cmd_status() -> None:
     """Show running state, budget summary, and active channels."""
     config = CatoConfig.load()
-    is_running = _PID_FILE.exists()
+    live_pid = _read_live_pid()
+    is_running = live_pid is not None
 
     safe_print("\nCato Status")
     safe_print("=" * 50)
@@ -638,8 +673,7 @@ def cmd_status() -> None:
     safe_print(f"  Workspace: {config.workspace_dir}")
 
     if is_running:
-        pid = _PID_FILE.read_text().strip()
-        safe_print(f"  Daemon:  RUNNING  (PID {pid})")
+        safe_print(f"  Daemon:  RUNNING  (PID {live_pid})")
     else:
         safe_print("  Daemon:  STOPPED")
 
@@ -934,7 +968,7 @@ def _run_cron_in_process(entry: dict, agent: str) -> None:
     loop = AgentLoop(config=cfg, budget=budget, vault=vault, memory=memory, context_builder=ctx)
 
     async def _run() -> None:
-        text, footer = await loop.run(
+        text, footer, _model = await loop.run(
             session_id=entry.get("session_id", f"cron-{agent}"),
             message=entry.get("prompt", ""),
             agent_id=agent,

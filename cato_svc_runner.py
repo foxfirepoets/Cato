@@ -41,15 +41,25 @@ try:
 except ImportError:
     pass
 
-from cato.cli import CatoConfig, Vault, BudgetManager, _CATO_DIR, _run_daemon, _PID_FILE
+from cato.cli import CatoConfig, Vault, BudgetManager, _CATO_DIR, _run_daemon, _PID_FILE, _read_live_pid
 
 vault_path = _CATO_DIR / "vault.enc"
 vault = Vault(vault_path=vault_path) if vault_path.exists() else None
 config = CatoConfig.load()
 budget = BudgetManager(session_cap=config.session_cap, monthly_cap=config.monthly_cap)
 
-if _PID_FILE.exists():
-    _PID_FILE.unlink(missing_ok=True)
+# BH-010 — Propagate config.workspace_dir to the file/shell/python tools via
+# an env var.  The tools resolve their workspace root at call time from
+# `CATO_WORKSPACE_DIR` if set (see cato/tools/file.py etc).  Without this
+# bridge the tools fall back to ~/.cato/workspace even when config points
+# elsewhere, which silently breaks the workspace_dir setting.
+if getattr(config, "workspace_dir", None):
+    os.environ["CATO_WORKSPACE_DIR"] = str(config.workspace_dir)
+
+live_pid = _read_live_pid()
+if live_pid is not None and live_pid != os.getpid():
+    logging.info("Cato daemon already running; runner exiting.")
+    sys.exit(0)
 _PID_FILE.write_text(str(os.getpid()))
 
 try:

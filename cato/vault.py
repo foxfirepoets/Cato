@@ -25,6 +25,26 @@ from .platform import get_data_dir
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Process-level vault password cache (F-07)
+# ---------------------------------------------------------------------------
+
+_CACHED_VAULT_PASSWORD: str | None = None
+
+
+def _get_vault_password() -> str | None:
+    """Return the vault password, caching it on first read to survive env var removal."""
+    global _CACHED_VAULT_PASSWORD
+    if _CACHED_VAULT_PASSWORD:
+        return _CACHED_VAULT_PASSWORD
+    env_password = os.environ.get("CATO_VAULT_PASSWORD")
+    if env_password:
+        _CACHED_VAULT_PASSWORD = env_password
+        os.environ.pop("CATO_VAULT_PASSWORD", None)
+        return _CACHED_VAULT_PASSWORD
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Canary key (P2-11)
 # ---------------------------------------------------------------------------
 
@@ -118,10 +138,10 @@ class Vault:
     def _prompt_password(self, confirm: bool = False) -> str:
         """Prompt for the master password, with optional confirmation."""
         import sys
-        # Check environment variable first
-        env_password = os.environ.get("CATO_VAULT_PASSWORD")
-        if env_password:
-            return env_password
+        # Check process-level cache and environment variable first
+        cached = _get_vault_password()
+        if cached:
+            return cached
 
         if not sys.stdin.isatty():
             raise VaultError(
@@ -182,7 +202,9 @@ class Vault:
         plaintext = json.dumps(self._data, ensure_ascii=True).encode("utf-8")
         blob = _encrypt(plaintext, self._key)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_bytes(base64.b64encode(salt + blob))
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_bytes(base64.b64encode(salt + blob))
+        os.replace(tmp, self._path)
 
     # ------------------------------------------------------------------
     # Public API
@@ -194,9 +216,14 @@ class Vault:
         If the returned value matches the canary key, logs a warning
         to alert of a potential credential leak.
         """
-        self._unlock()
+        try:
+            self._unlock()
+        except Exception:
+            return os.environ.get(key)
         assert self._data is not None
         value = self._data.get(key)
+        if not value:
+            value = os.environ.get(key) or value
         # Canary detection: if the value looks like our canary, warn
         if value is not None and key != CANARY_KEY_NAME:
             canary_val = self._data.get(CANARY_KEY_NAME)

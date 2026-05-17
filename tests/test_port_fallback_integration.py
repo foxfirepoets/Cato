@@ -13,7 +13,7 @@ from cato.budget import BudgetManager
 from cato.cli import _bind_http_site_with_fallback
 from cato.config import CatoConfig
 from cato.gateway import Gateway
-from cato.ui.server import create_ui_app
+from cato.ui.server import create_ui_app, _DAEMON_TOKEN
 
 
 class _StubAgentLoop:
@@ -128,7 +128,7 @@ async def test_fallback_port_keeps_http_and_websocket_surfaces_working(tmp_path:
                     data = await resp.json()
                     assert data["status"] == "ok"
 
-                async with session.ws_connect(f"http://127.0.0.1:{actual_port}/ws") as ws:
+                async with session.ws_connect(f"http://127.0.0.1:{actual_port}/ws", headers={"X-Cato-Token": _DAEMON_TOKEN}) as ws:
                     await ws.send_json(
                         {
                             "type": "node_register",
@@ -156,13 +156,14 @@ async def test_fallback_port_keeps_http_and_websocket_surfaces_working(tmp_path:
                 async with session.post(
                     f"http://127.0.0.1:{actual_port}/api/coding-agent/invoke",
                     json={"task": "Verify coding-agent websocket survives fallback port"},
+                    headers={"X-Cato-Token": _DAEMON_TOKEN},
                 ) as resp:
                     assert resp.status == 200
                     task_data = await resp.json()
 
                 task_id = task_data["task_id"]
                 async with session.ws_connect(
-                    f"http://127.0.0.1:{actual_port}/ws/coding-agent/{task_id}"
+                    f"http://127.0.0.1:{actual_port}/ws/coding-agent/{task_id}?token={_DAEMON_TOKEN}"
                 ) as coding_ws:
                     synthesis = await _receive_coding_agent_event(coding_ws, "synthesis_complete")
                     assert synthesis["data"]["primary"]["model"] == "claude"

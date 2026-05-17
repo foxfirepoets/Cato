@@ -68,7 +68,31 @@ function Assert-TauriCli {
     }
 }
 
+function Install-DesktopShortcut {
+    param(
+        [string]$RepoRoot,
+        [string]$ShortcutPath
+    )
+
+    $launcher = Join-Path $RepoRoot "Launch-CatoDesktop.ps1"
+    if (-not (Test-Path -LiteralPath $launcher)) {
+        throw "desktop launcher not found at $launcher"
+    }
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($ShortcutPath)
+    $shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$launcher`""
+    $shortcut.WorkingDirectory = $RepoRoot
+    $shortcut.IconLocation = Join-Path $RepoRoot "desktop\src-tauri\target\release\cato-desktop.exe"
+    $shortcut.Description = "Launch Cato Desktop with daemon health checks"
+    $shortcut.Save()
+
+    Write-Host "Shortcut: $ShortcutPath" -ForegroundColor Green
+}
+
 $desktopDir = $PSScriptRoot
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $desktopDir "..")).Path
 Set-Location $desktopDir
 
 Write-Host "=== Cato Desktop Build ===" -ForegroundColor Cyan
@@ -110,3 +134,7 @@ Write-Host "`n=== Build Complete ===" -ForegroundColor Green
 Write-Host "EXE:  src-tauri\target\release\cato-desktop.exe"
 Write-Host "MSI:  src-tauri\target\release\bundle\msi\"
 Write-Host "NSIS: src-tauri\target\release\bundle\nsis\"
+
+Write-Step "Updating desktop shortcut to use Launch-CatoDesktop.ps1..."
+$desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "Cato.lnk"
+Install-DesktopShortcut -RepoRoot $repoRoot -ShortcutPath $desktopShortcut

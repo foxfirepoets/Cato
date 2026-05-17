@@ -1,4 +1,4 @@
-//! Cato Desktop — Tauri backend
+//! Cato Desktop — Tauri backend (v0.2.1 — activity indicator)
 //!
 //! Manages the Python daemon sidecar, system tray, global hotkey,
 //! and native notifications.
@@ -25,6 +25,7 @@ struct DaemonStatus {
     running: bool,
     http_port: u16,
     ws_port: u16,
+    daemon_token: Option<String>,
 }
 
 /// Tauri command: get daemon status
@@ -35,6 +36,7 @@ async fn get_daemon_status(state: tauri::State<'_, AppState>) -> Result<DaemonSt
         running: mgr.is_running().await,
         http_port: mgr.http_port(),
         ws_port: mgr.ws_port(),
+        daemon_token: sidecar::SidecarManager::daemon_token(),
     })
 }
 

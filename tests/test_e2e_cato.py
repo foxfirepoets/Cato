@@ -276,17 +276,23 @@ class TestSafetyGuardE2E:
         assert guard.is_stop_requested() is False
 
     def test_safety_mode_off_always_allows(self):
-        """safety_mode: off → check_and_confirm always returns True."""
+        """safety_mode: off → non-shell tools pass; shell.exec requires shell_exec_allowed=true."""
         from cato.safety import SafetyGuard
 
         guard = SafetyGuard(config={"safety_mode": "off"})
 
-        # Even IRREVERSIBLE actions should pass without prompting
-        result = guard.check_and_confirm("shell", {"command": "rm -rf /important/stuff"})
-        assert result is True, "safety_mode: off should always return True"
-
+        # Non-shell actions pass without prompting
         result = guard.check_and_confirm("browser.navigate", {"url": "https://example.com"})
         assert result is True
+
+        # shell.exec blocked unless shell_exec_allowed is set (F-04: defense in depth)
+        result = guard.check_and_confirm("shell", {"command": "rm -rf /important/stuff"})
+        assert result is False, "shell.exec should be blocked in safety_mode=off without shell_exec_allowed=true"
+
+        # With explicit opt-in, shell is allowed in safety_mode=off
+        guard_with_shell = SafetyGuard(config={"safety_mode": "off", "shell_exec_allowed": True})
+        result = guard_with_shell.check_and_confirm("shell", {"command": "rm -rf /important/stuff"})
+        assert result is True, "shell.exec should pass with shell_exec_allowed=true"
 
 
 # ===========================================================================
