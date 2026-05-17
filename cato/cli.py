@@ -28,10 +28,12 @@ from rich.console import Console
 from rich.table import Table
 
 from cato import __version__
+from cato import vault_crypto
 from cato.budget import BudgetManager
 from cato.config import CatoConfig
 from cato.platform import get_data_dir, safe_print, setup_signal_handlers
-from cato.vault import Vault
+from cato.tools.genesis import list_agents as _genesis_list_agents
+from cato.vault import Vault, VaultError, get_vault
 
 console = Console()
 
@@ -321,6 +323,112 @@ def vault_delete(key: str) -> None:
     vault = Vault(vault_path=vault_path)
     vault.delete(key)
     safe_print(f"Key '{key}' deleted from vault.")
+
+
+# ---------------------------------------------------------------------------
+# cato genesis  (AP2 identity + SwarmSync Genesis Agents)
+# ---------------------------------------------------------------------------
+
+@main.group("genesis")
+def genesis_cmd() -> None:
+    """Manage Cato's AP2 identity and inspect the Genesis agent registry."""
+    pass
+
+
+@genesis_cmd.command("pubkey")
+def genesis_pubkey() -> None:
+    """Print Cato's AP2 Ed25519 public key (generates one if missing)."""
+    try:
+        vault = get_vault()
+    except Exception as exc:
+        safe_print(f"Error: could not access vault ({exc}).")
+        sys.exit(1)
+    try:
+        pub_b64 = vault_crypto.public_key_b64(vault)
+    except VaultError as exc:
+        safe_print(f"Error: vault is locked ({exc}).")
+        safe_print(
+            "Unlock the vault (set CATO_VAULT_PASSWORD or run 'cato init') "
+            "and try again."
+        )
+        sys.exit(1)
+    except Exception as exc:
+        safe_print(f"Error: vault is locked or unavailable ({exc}).")
+        sys.exit(1)
+    safe_print(f"Cato AP2 public key: {pub_b64}")
+    safe_print("Register this with SwarmSync to authorize signed requests.")
+    sys.exit(0)
+
+
+@genesis_cmd.command("list")
+def genesis_list() -> None:
+    """Print the 20-agent Genesis registry (slug, status, route, price)."""
+    agents = _genesis_list_agents()
+
+    headers = ("slug", "status", "route", "price_usd")
+    rows: list[tuple[str, str, str, str]] = []
+    for a in agents:
+        slug = str(a.get("slug", ""))
+        status = str(a.get("status", ""))
+        route_val = a.get("route")
+        route = "-" if route_val in (None, "") else str(route_val)
+        price_val = a.get("price_usd")
+        price = "-" if price_val in (None, "") else str(price_val)
+        rows.append((slug, status, route, price))
+
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            if len(cell) > widths[i]:
+                widths[i] = len(cell)
+
+    def _fmt(cells: tuple[str, str, str, str]) -> str:
+        return "  ".join(cells[i].ljust(widths[i]) for i in range(len(cells)))
+
+    safe_print(_fmt(headers))
+    safe_print("  ".join("-" * widths[i] for i in range(len(headers))))
+    for r in rows:
+        safe_print(_fmt(r))
+    sys.exit(0)
+
+
+@genesis_cmd.command("health")
+def genesis_health() -> None:
+    """GET {genesis_endpoint}/health and print status + body preview."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        cfg = CatoConfig.load()
+        endpoint = cfg.genesis_endpoint.rstrip("/")
+    except Exception as exc:
+        safe_print(f"Error: could not load config ({exc}).")
+        sys.exit(1)
+
+    url = f"{endpoint}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            status = resp.getcode()
+            body = resp.read(2048).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            body = exc.read(2048).decode("utf-8", errors="replace")
+        except Exception:
+            body = str(exc)
+        safe_print(f"Status: {status}")
+        safe_print(f"Body: {body[:500]}")
+        sys.exit(1)
+    except Exception as exc:
+        safe_print(f"Status: error")
+        safe_print(f"Error: {exc}")
+        sys.exit(1)
+
+    safe_print(f"Status: {status}")
+    safe_print(f"Body: {body[:500]}")
+    if 200 <= status < 300:
+        sys.exit(0)
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

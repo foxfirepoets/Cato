@@ -86,6 +86,12 @@ class CatoConfig:
     swarmsync_enabled: bool = True
     swarmsync_api_url: str = "https://api.swarmsync.ai/v1/chat/completions"
 
+    # Genesis Agents (SwarmSync agent registry / delegation)
+    genesis_enabled: bool = True
+    genesis_endpoint: str = "https://swarmsync-agents.onrender.com"
+    genesis_agent_allowlist: list = field(default_factory=list)
+    genesis_timeout_s: float = 30.0
+
     # Budget caps (USD)
     session_cap: float = 1.00
     monthly_cap: float = 20.00

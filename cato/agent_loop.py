@@ -42,6 +42,7 @@ from .core.memory import MemorySystem
 from .platform import get_data_dir
 from .router import ModelRouter
 from .safety import SafetyGuard
+from .tools.genesis import GENESIS_TOOL_SCHEMA
 from .vault import Vault
 
 logger = logging.getLogger(__name__)
@@ -247,6 +248,9 @@ _BUILTIN_SCHEMAS: dict[str, dict] = {
             },
         },
     },
+    # genesis: single source of truth lives in cato/tools/genesis.py
+    # to avoid schema drift between the tool module and the agent loop.
+    "genesis": GENESIS_TOOL_SCHEMA,
 }
 
 

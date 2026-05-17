@@ -7,10 +7,11 @@ handler into the loop's _TOOL_REGISTRY.
 
 from .browser import BrowserTool
 from .file import FileTool
+from .genesis import GENESIS_TOOL_SCHEMA, GenesisTool
 from .memory import MemoryTool
 from .shell import ShellTool
 
-__all__ = ["ShellTool", "FileTool", "BrowserTool", "MemoryTool"]
+__all__ = ["ShellTool", "FileTool", "BrowserTool", "MemoryTool", "GenesisTool"]
 
 
 def register_all_tools(agent_loop) -> None:
@@ -19,6 +20,7 @@ def register_all_tools(agent_loop) -> None:
     register_tool("shell", ShellTool().execute)
     register_tool("file", FileTool().execute)
     register_tool("memory", MemoryTool().execute)
+    register_tool("genesis", GenesisTool().execute, GENESIS_TOOL_SCHEMA)
 
     # Use Conduit browser engine if enabled in config, otherwise plain browser
     try:

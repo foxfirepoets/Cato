@@ -230,3 +230,114 @@ def test_register_all_tools():
     expected_keys = ["file", "browser", "shell.exec", "web.search", "python.execute", "flow.run"]
     for key in expected_keys:
         assert key in _TOOL_REGISTRY, f"'{key}' missing after register_all_tools"
+
+
+# ---------------------------------------------------------------------------
+# 15-16: GEN-002 regression — schema-shape sanitization
+# ---------------------------------------------------------------------------
+#
+# Background: GENESIS_TOOL_SCHEMA was originally registered in Anthropic
+# format ``{"name": ..., "input_schema": ...}`` while sibling entries in
+# ``_BUILTIN_SCHEMAS`` use OpenAI function-calling format
+# ``{"type": "function", "function": {"name": ..., "parameters": ...}}``.
+# When ``_sanitize_tool_defs()`` ran over the malformed entry it raised
+# ``KeyError: 'function'`` and crashed all tool calling. The schema is now
+# fixed. The tests below exercise the full real path so the bug cannot
+# return silently.
+
+
+def test_genesis_full_path_register_to_sanitize_succeeds():
+    """Regression: register_all_tools -> get_tool_definitions -> _sanitize_tool_defs
+    must NOT raise, every entry must have the OpenAI function shape, genesis
+    must be present, and every registered tool must appear in the output.
+
+    This locks in the fix for GEN-002: GENESIS_TOOL_SCHEMA was previously in
+    Anthropic format and crashed _sanitize_tool_defs with KeyError: 'function'.
+    """
+    # Production path: gateway calls both register_all_tools (cato.tools) and
+    # register_all_tools-as-conduit_web (cato.agent_loop). Mirror that here.
+    from cato.tools import register_all_tools as register_tools_pkg
+    from cato.agent_loop import (
+        register_all_tools as register_conduit_web_tools,
+        get_tool_definitions,
+        _sanitize_tool_defs,
+        _sanitize_tool_name,
+        _TOOL_REGISTRY,
+    )
+
+    class _StubAgentLoop:
+        """Minimal stub: register_all_tools in cato.tools only reads
+        agent_loop._cfg.conduit_enabled (wrapped in try/except)."""
+        pass
+
+    register_tools_pkg(_StubAgentLoop())
+    register_conduit_web_tools(lambda name, fn: None)
+
+    defs = get_tool_definitions()
+
+    # 1. Must not raise.
+    sanitized, reverse_map = _sanitize_tool_defs(defs)
+
+    # 2. Every entry has the OpenAI function shape.
+    for entry in sanitized:
+        assert isinstance(entry, dict), entry
+        assert set(entry.keys()) >= {"type", "function"}, (
+            f"entry missing required top-level keys: {entry}"
+        )
+        assert entry["type"] == "function", entry
+        fn = entry["function"]
+        assert isinstance(fn, dict), entry
+        assert isinstance(fn.get("name"), str) and fn["name"], (
+            f"entry has empty or non-string function.name: {entry}"
+        )
+        assert "parameters" in fn, f"entry missing function.parameters: {entry}"
+
+    # 3. Genesis specifically must be present by name (this is the regression).
+    sanitized_names = {e["function"]["name"] for e in sanitized}
+    assert "genesis" in sanitized_names, (
+        "genesis tool missing from sanitized definitions -- "
+        "regression of GEN-002 (schema-shape mismatch)"
+    )
+
+    # 4. Every registered tool maps to an entry in sanitized output (no drops).
+    # Tool names with dots (e.g. github.pr_review) get rewritten to
+    # github__pr_review by _sanitize_tool_name; compare on sanitized form.
+    expected_sanitized = {_sanitize_tool_name(n) for n in _TOOL_REGISTRY}
+    missing = expected_sanitized - sanitized_names
+    assert not missing, (
+        f"tools registered but absent from sanitized definitions: {missing}"
+    )
+
+    # And conversely the sanitized output must only describe registered tools.
+    extra = sanitized_names - expected_sanitized
+    assert not extra, (
+        f"sanitized definitions reference unregistered tool names: {extra}"
+    )
+
+
+def test_sanitize_tool_defs_crashes_on_anthropic_shape_entry():
+    """Defensive: confirm that a top-level Anthropic-shape entry
+    ({"name": ..., "input_schema": ...}) currently causes _sanitize_tool_defs
+    to raise KeyError. This is the EXACT failure mode GEN-002 produced.
+
+    Locking this in means that if anyone changes _sanitize_tool_defs to
+    silently pass through malformed entries (which would hide future
+    schema-shape bugs), this test will fail and force them to update both
+    the implementation and the contract here.
+
+    If a future change is to GRACEFULLY handle malformed shapes (drop them
+    or convert them) rather than crash, update this test to assert the new
+    behavior - but do so deliberately, not silently.
+    """
+    from cato.agent_loop import _sanitize_tool_defs
+
+    anthropic_shape = [{
+        "name": "bad_tool",
+        "description": "Anthropic-style schema without OpenAI function wrapper.",
+        "input_schema": {"type": "object", "properties": {}},
+    }]
+
+    # Current observed behaviour: KeyError on 'function' when the function
+    # tries to deep-copy the entry and write d2["function"]["name"].
+    with pytest.raises(KeyError):
+        _sanitize_tool_defs(anthropic_shape)
