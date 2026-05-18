@@ -15,11 +15,15 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, AsyncIterator, Optional, Tuple
 
 import aiohttp
+
+from cato.routing_log import get_persistent_routing_history, record_routing_event
 
 
 # ---------------------------------------------------------------------------
@@ -180,17 +184,26 @@ _PROVIDERS: list[tuple[str, str, str]] = [
     ("openrouter/", "https://openrouter.ai/api/v1/chat/completions",                            "openrouter"),
 ]
 
+_KNOWN_MODEL_PROVIDERS = frozenset([
+    "openrouter", "anthropic", "openai", "google", "deepseek",
+    "groq", "mistral", "minimax", "moonshot", "meta-llama",
+])
+
+
 def _is_model_slug_only(text: str) -> bool:
     """True if text looks like a model id (e.g. openrouter/minimax/minimax-m2.5) and nothing else.
     Some providers echo the model in stream content; we skip it so the UI doesn't show only the model name.
+    Requires a known provider prefix to avoid suppressing short responses like "A/B" or "I/O".
     """
     t = (text or "").strip()
     if not t or len(t) > 120:
         return False
-    # Model slugs: openrouter/..., provider/name, or single-word model ids
-    if t.startswith("openrouter/") or "/" in t and re.match(r"^[\w\-./]+$", t):
+    if t.startswith("openrouter/"):
         return True
-    return False
+    if "/" not in t:
+        return False
+    provider = t.split("/")[0].lower()
+    return provider in _KNOWN_MODEL_PROVIDERS and re.match(r"^[\w\-./]+$", t) is not None
 
 
 # Signal regexes for complexity scoring
@@ -209,7 +222,50 @@ _ROUTING_HISTORY_MAX = 200
 
 def get_routing_history() -> list[dict]:
     """Return the routing decision history buffer."""
+    persistent = get_persistent_routing_history(limit=_ROUTING_HISTORY_MAX)
+    if persistent:
+        return persistent
     return list(_routing_history)
+
+
+def _coerce_model_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    if isinstance(value, dict):
+        return [str(key) for key in value.keys()]
+    return []
+
+
+def _extract_cost(data: dict[str, Any], *names: str) -> Any:
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    swarmsync = data.get("swarmsync") if isinstance(data.get("swarmsync"), dict) else {}
+    for name in names:
+        for source in (swarmsync, usage, data):
+            if source.get(name) is not None:
+                return source[name]
+    return None
+
+
+def _record_routing_decision(record: dict[str, Any]) -> None:
+    """Persist one SwarmSync routing decision and keep a short in-memory mirror."""
+    _routing_history.append(record)
+    if len(_routing_history) > _ROUTING_HISTORY_MAX:
+        del _routing_history[:-_ROUTING_HISTORY_MAX]
+    record_routing_event({
+        "ts": time.time(),
+        "provider": record.get("provider", "swarmsync"),
+        "status": "ok" if record.get("success") else "fallback",
+        "routed_model": record.get("routed_model") or record.get("chosen_model") or "",
+        "raw_model": record.get("raw_model", ""),
+        "complexity": record.get("complexity_score", 0.0),
+        "has_tools": record.get("has_tools", False),
+        "msg_count": record.get("history_length", 0),
+        "http_status": record.get("http_status"),
+        "content_chars": record.get("content_chars", 0),
+        "tool_call_count": record.get("tool_call_count", 0),
+        "error": record.get("error", ""),
+        "metadata": record,
+    })
 
 
 class ModelRouter:
@@ -235,9 +291,11 @@ class ModelRouter:
         self._swarmsync_url = swarmsync_api_url
         self._max_output_tokens = max_output_tokens
 
-        # Circuit breaker state (T12) — open after 3 consecutive failures for 60s
-        self._cb_failures: int = 0
-        self._cb_open_until: float = 0.0
+        # Circuit breaker state — separate counters for SwarmSync vs direct LLM paths
+        self._ss_cb_failures: int = 0       # SwarmSync API path
+        self._ss_cb_open_until: float = 0.0
+        self._direct_cb_failures: int = 0   # direct provider path
+        self._direct_cb_open_until: float = 0.0
         self._CB_THRESHOLD = 3
         self._CB_COOLDOWN = 60.0
 
@@ -349,15 +407,40 @@ class ModelRouter:
         if tools:
             payload["tools"] = tools
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        # Circuit breaker check (T12)
+        request_id = str(uuid.uuid4())
+        base_record: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request_id": request_id,
+            "provider": "swarmsync",
+            "complexity_score": score,
+            "history_length": len(messages),
+            "has_tools": bool(tools),
+            "swarmsync_api_url": self._swarmsync_url,
+            "fallback_routing": False,
+            "success": False,
+        }
+        # Circuit breaker check — SwarmSync path only
         import time as _time
-        if self._cb_failures >= self._CB_THRESHOLD:
-            if _time.monotonic() < self._cb_open_until:
+        if self._ss_cb_failures >= self._CB_THRESHOLD:
+            if _time.monotonic() < self._ss_cb_open_until:
                 logger.warning("SwarmSync circuit open — using local selection")
-                return self.select_model(score), {"role": "assistant", "content": ""}
+                fallback_model = self.select_model(score)
+                _record_routing_decision({
+                    **base_record,
+                    "chosen_model": fallback_model,
+                    "raw_model": "",
+                    "routing_reason": "SwarmSync circuit breaker open; local fallback selected",
+                    "tier": "",
+                    "considered_models": [],
+                    "estimated_cost": None,
+                    "actual_cost": None,
+                    "fallback_routing": True,
+                    "error": "circuit_open",
+                })
+                return fallback_model, {"role": "assistant", "content": ""}
             else:
                 # Half-open: allow one probe
-                self._cb_failures = 0
+                self._ss_cb_failures = 0
 
         try:
             import aiohttp as _aiohttp
@@ -372,25 +455,27 @@ class ModelRouter:
                     # SwarmSync returns 200 or 201 depending on version
                     if r.status in (200, 201):
                         data = await r.json()
+                        response_request_id = (
+                            data.get("request_id")
+                            or data.get("id")
+                            or r.headers.get("X-Request-ID")
+                            or request_id
+                        )
+                        swarmsync_meta = data.get("swarmsync", {}) if isinstance(data.get("swarmsync"), dict) else {}
                         # Extract routed model name
                         raw_model = (
-                            data.get("swarmsync", {}).get("routed_model", "")
+                            swarmsync_meta.get("routed_model", "")
                             or data.get("model", "")
                         )
                         model = self.select_model(score)  # fallback
                         if raw_model and raw_model != "auto":
                             model = self._resolve_swarmsync_model(raw_model, score)
                             logger.info("SwarmSync routed to: %s (raw: %s)", model, raw_model)
-                        _routing_history.append({
-                            "ts": time.time(),
-                            "routed_model": model,
-                            "raw_model": raw_model,
-                            "complexity": score,
-                            "has_tools": bool(tools),
-                            "msg_count": len(messages),
-                        })
-                        if len(_routing_history) > _ROUTING_HISTORY_MAX:
-                            del _routing_history[:-_ROUTING_HISTORY_MAX]
+                        considered_models = (
+                            _coerce_model_list(swarmsync_meta.get("considered_models"))
+                            or _coerce_model_list(swarmsync_meta.get("candidates"))
+                            or _coerce_model_list(swarmsync_meta.get("model_candidates"))
+                        )
                         # Extract completion text from choices
                         message: dict[str, Any] = {"role": "assistant", "content": ""}
                         choices = data.get("choices", [])
@@ -405,21 +490,76 @@ class ModelRouter:
                                     message["tool_calls"] = raw_message["tool_calls"]
                                 if raw_message.get("function_call"):
                                     message["function_call"] = raw_message["function_call"]
-                        self._cb_failures = 0  # success — reset circuit
+                        self._ss_cb_failures = 0  # success — reset SwarmSync circuit
+                        tool_call_count = len(message.get("tool_calls") or [])
+                        _record_routing_decision({
+                            **base_record,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "request_id": response_request_id,
+                            "chosen_model": model,
+                            "routed_model": model,
+                            "raw_model": _scrub_log_text(raw_model),
+                            "routing_reason": _scrub_log_text(
+                                swarmsync_meta.get("routing_reason")
+                                or swarmsync_meta.get("reason")
+                                or swarmsync_meta.get("selection_reason")
+                                or ""
+                            ),
+                            "tier": swarmsync_meta.get("tier", ""),
+                            "considered_models": considered_models,
+                            "estimated_cost": _extract_cost(data, "estimated_cost", "estimated_cost_usd", "estimated_total_cost_usd"),
+                            "actual_cost": _extract_cost(data, "actual_cost", "actual_cost_usd", "cost", "cost_usd", "total_cost"),
+                            "fallback_routing": bool(swarmsync_meta.get("fallback") or swarmsync_meta.get("fallback_routing")),
+                            "success": True,
+                            "http_status": r.status,
+                            "content_chars": len(message.get("content", "") or ""),
+                            "tool_call_count": tool_call_count,
+                        })
                         logger.info("SwarmSync raw content repr: %r", _scrub_log_text(message.get("content", "")[:300]))
                         return model, message
                     else:
                         body = await r.text()
                         logger.warning("SwarmSync HTTP %d: %s", r.status, body[:200])
-                        self._cb_failures += 1
-                        if self._cb_failures >= self._CB_THRESHOLD:
-                            self._cb_open_until = _time.monotonic() + self._CB_COOLDOWN
+                        self._ss_cb_failures += 1
+                        fallback_model = self.select_model(score)
+                        _record_routing_decision({
+                            **base_record,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "chosen_model": fallback_model,
+                            "routed_model": fallback_model,
+                            "raw_model": "",
+                            "routing_reason": f"SwarmSync HTTP {r.status}; local fallback selected",
+                            "tier": "",
+                            "considered_models": [],
+                            "estimated_cost": None,
+                            "actual_cost": None,
+                            "fallback_routing": True,
+                            "http_status": r.status,
+                            "error": _scrub_log_text(body[:500]),
+                        })
+                        if self._ss_cb_failures >= self._CB_THRESHOLD:
+                            self._ss_cb_open_until = _time.monotonic() + self._CB_COOLDOWN
                             logger.warning("SwarmSync circuit opened for %.0fs", self._CB_COOLDOWN)
         except Exception as exc:
             logger.warning("SwarmSync completion failed: %s — using local selection", exc)
-            self._cb_failures += 1
-            if self._cb_failures >= self._CB_THRESHOLD:
-                self._cb_open_until = _time.monotonic() + self._CB_COOLDOWN
+            self._ss_cb_failures += 1
+            fallback_model = self.select_model(score)
+            _record_routing_decision({
+                **base_record,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "chosen_model": fallback_model,
+                "routed_model": fallback_model,
+                "raw_model": "",
+                "routing_reason": "SwarmSync exception; local fallback selected",
+                "tier": "",
+                "considered_models": [],
+                "estimated_cost": None,
+                "actual_cost": None,
+                "fallback_routing": True,
+                "error": _scrub_log_text(str(exc)),
+            })
+            if self._ss_cb_failures >= self._CB_THRESHOLD:
+                self._ss_cb_open_until = _time.monotonic() + self._CB_COOLDOWN
                 logger.warning("SwarmSync circuit opened for %.0fs", self._CB_COOLDOWN)
         return self.select_model(score), {"role": "assistant", "content": ""}
 
@@ -485,8 +625,8 @@ class ModelRouter:
             try:
                 async for chunk in self._complete_single(attempt_model, messages, tools):
                     yield chunk
-                # Success — reset circuit breaker
-                self._cb_failures = 0
+                # Success — reset direct-LLM circuit breaker
+                self._direct_cb_failures = 0
                 return
             except Exception as exc:
                 classified = classify_api_error(exc)
@@ -497,10 +637,10 @@ class ModelRouter:
                 )
                 last_error = exc
 
-                # Circuit breaker bookkeeping
-                self._cb_failures += 1
-                if self._cb_failures >= self._CB_THRESHOLD:
-                    self._cb_open_until = time.monotonic() + self._CB_COOLDOWN
+                # Circuit breaker bookkeeping — direct provider path only
+                self._direct_cb_failures += 1
+                if self._direct_cb_failures >= self._CB_THRESHOLD:
+                    self._direct_cb_open_until = time.monotonic() + self._CB_COOLDOWN
 
                 if not classified.should_fallback:
                     # Non-recoverable errors (format, context overflow) — don't

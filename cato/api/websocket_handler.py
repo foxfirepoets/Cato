@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -195,8 +196,28 @@ async def coding_agent_ws_handler(request: web.Request) -> web.WebSocketResponse
     task_id = request.match_info.get("task_id", "unknown")
     logger.info("WebSocket connection for task %s", task_id)
 
+    daemon_token: str = request.app.get("daemon_token", "")
+
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
+
+    # Authenticate: only required when daemon_token is configured.
+    if daemon_token:
+        token = (request.headers.get("X-Cato-Token", "")
+                 or request.rel_url.query.get("token", ""))
+        if not token:
+            try:
+                first_msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+                if first_msg.type == WSMsgType.TEXT:
+                    parsed = json.loads(first_msg.data)
+                    if parsed.get("type") == "auth":
+                        token = str(parsed.get("token") or "")
+            except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+                pass
+        if not secrets.compare_digest(token, daemon_token):
+            await ws.send_str(_serialize_event("error", {"message": "Unauthorized", "model": None}))
+            await ws.close(code=4401, message=b"Unauthorized")
+            return ws
 
     # Retrieve task from store
     task_info = _task_store.get(task_id)

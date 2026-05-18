@@ -48,7 +48,6 @@ export function ActivityIndicator({ httpPort, wsRef }: ActivityIndicatorProps) {
   // Track elapsed time while busy
   useEffect(() => {
     if (!activity.busy) {
-      setElapsed(0);
       startRef.current = 0;
       return;
     }
@@ -89,9 +88,14 @@ export function ActivityIndicator({ httpPort, wsRef }: ActivityIndicatorProps) {
   }, [httpPort]);
 
   useEffect(() => {
-    poll();
+    const initial = setTimeout(() => {
+      void poll();
+    }, 0);
     const t = setInterval(poll, 1000);
-    return () => clearInterval(t);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(t);
+    };
   }, [poll]);
 
   // Listen for WS "activity" events (instant push)
@@ -121,7 +125,6 @@ export function ActivityIndicator({ httpPort, wsRef }: ActivityIndicatorProps) {
   // BH-011 — Tick the tool-elapsed counter while a current_tool is set.
   useEffect(() => {
     if (!activity.currentTool || !activity.toolStartedAt) {
-      setToolElapsed(0);
       return;
     }
     const start = activity.toolStartedAt * 1000;
@@ -157,6 +160,8 @@ export function ActivityIndicator({ httpPort, wsRef }: ActivityIndicatorProps) {
       ? `${activity.currentTool}\n— turn task: ${activity.task || "(no preview)"}`
       : `Working on: ${activity.task}`
     : "Agent is idle";
+  const displayElapsed = activity.busy ? elapsed : 0;
+  const displayToolElapsed = activity.currentTool && activity.toolStartedAt ? toolElapsed : 0;
 
   return (
     <div
@@ -165,13 +170,13 @@ export function ActivityIndicator({ httpPort, wsRef }: ActivityIndicatorProps) {
     >
       {activity.busy && <span className="activity-spinner" />}
       <span className="activity-label">{primaryLabel}</span>
-      {activity.busy && activity.currentTool && toolElapsed > 2 && (
+      {activity.busy && activity.currentTool && displayToolElapsed > 2 && (
         <span className="activity-tool-elapsed" style={{ marginLeft: 6, opacity: 0.75 }}>
-          ({formatElapsed(toolElapsed)})
+          ({formatElapsed(displayToolElapsed)})
         </span>
       )}
-      {activity.busy && elapsed > 0 && (
-        <span className="activity-elapsed">{formatElapsed(elapsed)}</span>
+      {activity.busy && displayElapsed > 0 && (
+        <span className="activity-elapsed">{formatElapsed(displayElapsed)}</span>
       )}
     </div>
   );

@@ -42,6 +42,7 @@ from .core.memory import MemorySystem
 from .platform import get_data_dir
 from .router import ModelRouter
 from .safety import SafetyGuard
+from .swarmsync import get_swarmsync_api_key
 from .tools.genesis import GENESIS_TOOL_SCHEMA
 from .vault import Vault
 
@@ -1466,7 +1467,7 @@ class AgentLoop:
         messages.append({"role": "user", "content": message})
 
         # Model selection — SwarmSync routes ALL turns when enabled.
-        swarm_key = self._vault.get("SWARMSYNC_API_KEY")
+        swarm_key, swarm_key_source = get_swarmsync_api_key(self._vault)
         if not swarm_key:
             logger.warning("SWARMSYNC_API_KEY not found in vault — SwarmSync routing disabled, using degraded fallback model")
         use_swarmsync = self._cfg.swarmsync_enabled and bool(swarm_key)
@@ -1475,8 +1476,8 @@ class AgentLoop:
         _swarm_name_map: dict[str, str] = {}  # sanitized → original
         if use_swarmsync:
             _tools_for_swarm, _swarm_name_map = _sanitize_tool_defs(get_tool_definitions())
-        logger.info("session=%s swarmsync_enabled=%s swarm_key_present=%s",
-                    session_id, use_swarmsync, bool(swarm_key))
+        logger.info("session=%s swarmsync_enabled=%s swarm_key_present=%s source=%s",
+                    session_id, use_swarmsync, bool(swarm_key), swarm_key_source or "none")
         if not use_swarmsync:
             model = self._router.select_model(complexity)
         else:

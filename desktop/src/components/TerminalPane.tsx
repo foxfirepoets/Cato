@@ -44,8 +44,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         const protocol = wsBase.startsWith("https") ? "wss" : "ws";
         const host = wsBase.replace(/^https?:\/\//, "").replace(/^\/+/, "");
         const token = (window as Window & { __CATO_DAEMON_TOKEN__?: string }).__CATO_DAEMON_TOKEN__;
-        const qs = token ? `?token=${encodeURIComponent(token)}` : "";
-        const wsUrl = `${protocol}://${host}/ws/pty/${sessionId}${qs}`;
+        const wsUrl = `${protocol}://${host}/ws/pty/${sessionId}`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
@@ -77,6 +76,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         resizeObserverRef.current = resizeObserver;
 
         ws.onopen = () => {
+          if (token) ws.send(JSON.stringify({ type: "auth", token }));
           fitAddon.fit();
           const { cols, rows } = term;
           if (cols && rows) {
@@ -101,7 +101,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     }
     connect();
     return () => {
-      if (resizeObserverRef.current && containerRef.current) {
+      if (resizeObserverRef.current) {
         resizeObserverRef.current.disconnect();
         resizeObserverRef.current = null;
       }

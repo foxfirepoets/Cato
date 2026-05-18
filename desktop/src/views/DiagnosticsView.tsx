@@ -5,12 +5,303 @@
  * Each tab fetches its endpoint on first activation (lazy load).
  */
 import React, { useState, useCallback } from "react";
+import { sendChatSocketPayload } from "../lib/chatTransport";
 
 interface DiagnosticsViewProps {
   httpPort: number;
+  wsPort?: number;
+  daemonToken?: string;
 }
 
-type TabId = "tiers" | "contradictions" | "decisions" | "anomalies" | "corrections" | "disagreements" | "epistemic" | "context" | "retrieval" | "habits";
+type TabId = "swarmsync" | "tiers" | "contradictions" | "decisions" | "anomalies" | "corrections" | "disagreements" | "epistemic" | "context" | "retrieval" | "habits";
+
+// ---------------------------------------------------------------------------
+// SwarmSync Tab
+// ---------------------------------------------------------------------------
+
+interface RoutingLiveTest {
+  http_status?: number;
+  routed_model?: string;
+  routing_reason?: string;
+  tier?: string;
+  complexity_score?: number;
+  error?: string;
+}
+
+interface RoutingStatus {
+  swarmsync_enabled?: boolean;
+  swarmsync_api_url?: string;
+  default_model?: string;
+  swarm_key_present?: boolean;
+  openrouter_key_present?: boolean;
+  will_use_swarmsync?: boolean;
+  live_test?: RoutingLiveTest;
+  error?: string;
+}
+
+interface SelfTestResult {
+  status: "pass" | "fail";
+  reason: string;
+  details: string[];
+}
+
+const boolLabel = (value: boolean | undefined): string => value ? "Present" : "Missing";
+const enabledLabel = (value: boolean | undefined): string => value ? "Yes" : "No";
+
+function statusBadgeStyle(ok: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    borderRadius: 10,
+    padding: "2px 8px",
+    fontSize: "0.72rem",
+    fontWeight: 700,
+    background: ok ? "#14532d44" : "#7f1d1d44",
+    color: ok ? "#86efac" : "#fca5a5",
+    border: `1px solid ${ok ? "#15803d" : "#ef4444"}`,
+  };
+}
+
+function FieldRow({ label, value, tone }: { label: string; value: React.ReactNode; tone?: "ok" | "warn" | "error" }) {
+  const color = tone === "ok" ? "#86efac" : tone === "warn" ? "#fcd34d" : tone === "error" ? "#fca5a5" : "var(--text-primary, #e2e8f0)";
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--border, #222)" }}>
+      <span style={{ color: "var(--text-secondary, #aaa)", fontSize: "0.82rem" }}>{label}</span>
+      <span style={{ color, fontSize: "0.82rem", fontWeight: 600, textAlign: "right", overflowWrap: "anywhere" }}>{value || "-"}</span>
+    </div>
+  );
+}
+
+async function runFirstMessageSelfTest(httpPort: number, wsPort: number, daemonToken?: string): Promise<SelfTestResult> {
+  const details: string[] = [];
+  const base = `http://127.0.0.1:${httpPort}`;
+
+  try {
+    const health = await fetch(`${base}/health`);
+    if (!health.ok) {
+      return { status: "fail", reason: `/health returned HTTP ${health.status}`, details };
+    }
+    const healthJson = await health.json() as { status?: string };
+    if (healthJson.status !== "ok") {
+      return { status: "fail", reason: `/health status was ${healthJson.status || "missing"}`, details };
+    }
+    details.push("Runtime health endpoint returned ok.");
+  } catch (e) {
+    return { status: "fail", reason: `Runtime health request failed: ${String(e)}`, details };
+  }
+
+  try {
+    const routing = await fetch(`${base}/api/routing/status`);
+    if (!routing.ok) {
+      return { status: "fail", reason: `/api/routing/status returned HTTP ${routing.status}`, details };
+    }
+    const routingJson = await routing.json() as RoutingStatus;
+    if (routingJson.error) {
+      return { status: "fail", reason: `Routing diagnostics reported: ${routingJson.error}`, details };
+    }
+    details.push(`Routing diagnostics loaded; will_use_swarmsync=${Boolean(routingJson.will_use_swarmsync)}.`);
+  } catch (e) {
+    return { status: "fail", reason: `Routing diagnostics request failed: ${String(e)}`, details };
+  }
+
+  const token = daemonToken || (window as Window & { __CATO_DAEMON_TOKEN__?: string }).__CATO_DAEMON_TOKEN__;
+  if (!token) {
+    return {
+      status: "fail",
+      reason: "Missing daemon token for WebSocket authentication.",
+      details,
+    };
+  }
+
+  return await new Promise<SelfTestResult>((resolve) => {
+    const qs = `?token=${encodeURIComponent(token)}`;
+    const ws = new WebSocket(`ws://127.0.0.1:${wsPort}/ws${qs}`);
+    let settled = false;
+    const finish = (result: SelfTestResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+      resolve(result);
+    };
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+      finish({
+        status: "fail",
+        reason: "Timed out waiting for WebSocket health roundtrip.",
+        details,
+      });
+    }, 5000);
+
+    ws.onopen = () => {
+      details.push("WebSocket opened on the same endpoint used by chat submissions.");
+      sendChatSocketPayload(ws, { type: "health" });
+    };
+    ws.onmessage = (ev: MessageEvent<string>) => {
+      try {
+        const data = JSON.parse(ev.data) as { type?: string; status?: string };
+        if (data.type === "health" && data.status === "ok") {
+          finish({
+            status: "pass",
+            reason: "Local first-message transport is ready.",
+            details: [...details, "Chat transport serializer/send path returned a health response."],
+          });
+          return;
+        }
+        finish({
+          status: "fail",
+          reason: `Unexpected WebSocket response: ${ev.data.slice(0, 160)}`,
+          details,
+        });
+      } catch (e) {
+        finish({
+          status: "fail",
+          reason: `Invalid WebSocket JSON response: ${String(e)}`,
+          details,
+        });
+      }
+    };
+    ws.onerror = () => {
+      finish({
+        status: "fail",
+        reason: "WebSocket connection errored before the roundtrip completed.",
+        details,
+      });
+    };
+    ws.onclose = () => {
+      finish({
+        status: "fail",
+        reason: "WebSocket closed before returning the health roundtrip.",
+        details,
+      });
+    };
+  });
+}
+
+function SwarmSyncTab({ httpPort, wsPort, daemonToken }: { httpPort: number; wsPort?: number; daemonToken?: string }) {
+  const [data, setData] = useState<RoutingStatus | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selfTesting, setSelfTesting] = useState(false);
+  const [selfTest, setSelfTest] = useState<SelfTestResult | null>(null);
+
+  const fetch_ = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await fetch(`http://127.0.0.1:${httpPort}/api/routing/status`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setData(await r.json() as RoutingStatus);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [httpPort]);
+
+  React.useEffect(() => { fetch_(); }, [fetch_]);
+
+  const handleSelfTest = useCallback(async () => {
+    setSelfTesting(true);
+    setSelfTest(null);
+    try {
+      setSelfTest(await runFirstMessageSelfTest(httpPort, wsPort ?? httpPort, daemonToken));
+    } finally {
+      setSelfTesting(false);
+    }
+  }, [httpPort, wsPort, daemonToken]);
+
+  const live = data?.live_test;
+  const hasFailure = Boolean(error || data?.error || live?.error || data?.will_use_swarmsync === false);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+        <div>
+          <h3 style={{ fontSize: "0.95rem", marginBottom: 4 }}>SwarmSync Live Status</h3>
+          <p style={{ color: "var(--text-secondary, #aaa)", fontSize: "0.82rem" }}>
+            Pulled from /api/routing/status with a live routing probe when SwarmSync is enabled.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn-secondary-sm" onClick={fetch_} disabled={loading}>
+            {loading ? "Refreshing..." : "Refresh"}
+          </button>
+          <button className="btn-primary btn-sm" onClick={handleSelfTest} disabled={selfTesting}>
+            {selfTesting ? "Testing..." : "Run self-test"}
+          </button>
+        </div>
+      </div>
+
+      {error && <p style={{ color: "var(--error, #f87171)" }}>Error: {error}</p>}
+      {loading && !data && <p style={{ color: "var(--text-secondary, #aaa)" }}>Loading...</p>}
+
+      {data && (
+        <div style={{
+          border: `1px solid ${hasFailure ? "#f59e0b" : "#15803d"}`,
+          borderRadius: 8,
+          background: "var(--surface, #1e1e2e)",
+          padding: "1rem",
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
+            <strong style={{ fontSize: "0.9rem" }}>Routing Readiness</strong>
+            <span style={statusBadgeStyle(!hasFailure)}>
+              {!hasFailure ? "Ready" : "Attention"}
+            </span>
+          </div>
+          <FieldRow label="SwarmSync key" value={boolLabel(data.swarm_key_present)} tone={data.swarm_key_present ? "ok" : "error"} />
+          <FieldRow label="OpenRouter key" value={boolLabel(data.openrouter_key_present)} tone={data.openrouter_key_present ? "ok" : undefined} />
+          <FieldRow label="SwarmSync enabled" value={enabledLabel(data.swarmsync_enabled)} tone={data.swarmsync_enabled ? "ok" : "warn"} />
+          <FieldRow label="Will use SwarmSync" value={enabledLabel(data.will_use_swarmsync)} tone={data.will_use_swarmsync ? "ok" : "error"} />
+          <FieldRow label="Live routed model" value={live?.routed_model || data.default_model} tone={live?.routed_model ? "ok" : undefined} />
+          <FieldRow label="Routing reason" value={live?.routing_reason || live?.error || data.error || "No live routing reason reported"} tone={live?.error || data.error ? "error" : undefined} />
+          <FieldRow label="Tier" value={live?.tier || "-"} />
+          <FieldRow label="Failure state" value={live?.error || data.error || (data.will_use_swarmsync ? "None" : "SwarmSync will not be used")} tone={hasFailure ? "error" : "ok"} />
+        </div>
+      )}
+
+      <div style={{
+        border: "1px solid var(--border, #333)",
+        borderRadius: 8,
+        background: "var(--surface, #1e1e2e)",
+        padding: "1rem",
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 8 }}>
+          <div>
+            <strong style={{ fontSize: "0.9rem" }}>First Message Self-Test</strong>
+            <p style={{ color: "var(--text-secondary, #aaa)", fontSize: "0.8rem", marginTop: 4 }}>
+              Checks runtime health, routing diagnostics, WebSocket auth, and the chat transport send path without invoking a model.
+            </p>
+          </div>
+          {selfTest && (
+            <span style={statusBadgeStyle(selfTest.status === "pass")}>
+              {selfTest.status === "pass" ? "Pass" : "Fail"}
+            </span>
+          )}
+        </div>
+        {selfTest ? (
+          <div>
+            <p style={{ color: selfTest.status === "pass" ? "#86efac" : "#fca5a5", fontSize: "0.85rem", fontWeight: 700 }}>
+              {selfTest.reason}
+            </p>
+            <ul style={{ marginTop: 8, paddingLeft: "1rem", color: "var(--text-secondary, #aaa)", fontSize: "0.8rem", lineHeight: 1.6 }}>
+              {selfTest.details.map((detail) => <li key={detail}>{detail}</li>)}
+            </ul>
+          </div>
+        ) : (
+          <p style={{ color: "var(--text-secondary, #aaa)", fontSize: "0.82rem" }}>
+            Run this before a real first request when the daemon was just started or routing keys changed.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Query Tiers Tab
@@ -757,6 +1048,7 @@ function HabitsTab({ httpPort }: { httpPort: number }) {
 // ---------------------------------------------------------------------------
 
 const TABS: { id: TabId; label: string }[] = [
+  { id: "swarmsync",      label: "SwarmSync" },
   { id: "tiers",          label: "Query Tiers" },
   { id: "contradictions", label: "Contradictions" },
   { id: "decisions",      label: "Decisions" },
@@ -769,8 +1061,8 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "habits",         label: "Habits" },
 ];
 
-export function DiagnosticsView({ httpPort }: DiagnosticsViewProps) {
-  const [activeTab, setActiveTab] = useState<TabId>("tiers");
+export function DiagnosticsView({ httpPort, wsPort, daemonToken }: DiagnosticsViewProps) {
+  const [activeTab, setActiveTab] = useState<TabId>("swarmsync");
 
   const tabContentStyle: React.CSSProperties = {
     padding: "1.25rem",
@@ -815,6 +1107,7 @@ export function DiagnosticsView({ httpPort }: DiagnosticsViewProps) {
 
       {/* Tab content — always mounted so lazy fetch fires on first activation */}
       <div style={tabContentStyle}>
+        {activeTab === "swarmsync"      && <SwarmSyncTab      httpPort={httpPort} wsPort={wsPort} daemonToken={daemonToken} />}
         {activeTab === "tiers"          && <QueryTiersTab      httpPort={httpPort} />}
         {activeTab === "contradictions" && <ContradictionsTab  httpPort={httpPort} />}
         {activeTab === "decisions"      && <DecisionsTab       httpPort={httpPort} />}

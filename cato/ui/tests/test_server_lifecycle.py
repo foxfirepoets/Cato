@@ -200,6 +200,30 @@ async def test_health_endpoint_sessions_from_gateway():
         assert data["sessions"] == 2
 
 
+@pytest.mark.asyncio
+async def test_routing_status_accepts_legacy_swarmsync_key_without_live_test():
+    """Routing status reports normalized legacy key source without requiring a live call."""
+    cfg = MagicMock()
+    cfg.swarmsync_enabled = False
+    cfg.swarmsync_api_url = "https://example.invalid/v1/chat/completions"
+    cfg.default_model = "openrouter/minimax/minimax-m2.5"
+    vault = MagicMock()
+    vault.get.side_effect = lambda key: {"SWARM_SYNC_API_KEY": "legacy-key"}.get(key, "")
+    gateway = MagicMock()
+    gateway._cfg = cfg
+    gateway._vault = vault
+    gateway._lanes = {}
+    app = await create_ui_app(gateway=gateway)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/routing/status", headers=_auth_headers())
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["swarm_key_present"] is True
+        assert data["swarm_key_source"] == "SWARM_SYNC_API_KEY"
+        assert data["swarm_key_needs_normalization"] is True
+
+
 # ------------------------------------------------------------------ #
 # Config endpoint                                                     #
 # ------------------------------------------------------------------ #

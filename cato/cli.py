@@ -653,74 +653,9 @@ def cmd_doctor(skills: bool, attest: bool) -> None:
         _cmd_doctor_skills()
         return
 
-    # Default doctor
-    from cato.core.context_builder import ContextBuilder
+    from cato.doctor import DoctorReport
 
-    safe_print("\nCato Doctor")
-    safe_print("=" * 50)
-
-    cb = ContextBuilder()
-    agents_dir = _CATO_DIR / "agents"
-
-    if not agents_dir.exists() or not any(agents_dir.iterdir()):
-        safe_print("No agent workspaces found in agents/")
-    else:
-        table = Table(title="Agent Workspace Token Audit", show_lines=True)
-        table.add_column("Agent", style="cyan")
-        table.add_column("Files", justify="right")
-        table.add_column("Tokens", justify="right")
-        table.add_column("Budget %", justify="right")
-        table.add_column("Flags", style="yellow")
-
-        for agent_dir in sorted(agents_dir.iterdir()):
-            if not agent_dir.is_dir():
-                continue
-
-            md_files = list(agent_dir.glob("*.md"))
-            total_tokens = 0
-            flags: list[str] = []
-
-            for md in md_files:
-                try:
-                    content = md.read_text(encoding="utf-8", errors="replace")
-                    total_tokens += cb.count_tokens(content)
-                except OSError:
-                    pass
-
-            if not any((agent_dir / f).exists() for f in ["SKILL.md", "SOUL.md", "IDENTITY.md"]):
-                flags.append("no SKILL.md/SOUL.md")
-
-            budget_pct = min(999, int(total_tokens / 7000 * 100))
-            flag_str = ", ".join(flags) if flags else "[green]OK[/green]"
-
-            table.add_row(
-                agent_dir.name,
-                str(len(md_files)),
-                str(total_tokens),
-                f"{budget_pct}%",
-                flag_str,
-            )
-
-        console.print(table)
-
-    # Budget status
-    safe_print("\nBudget Status")
-    bm = BudgetManager()
-    status = bm.get_status()
-    safe_print(f"  Monthly:  ${status['monthly_spend']:.4f} / ${status['monthly_cap']:.2f}"
-               f"  ({status['monthly_pct_remaining']:.0f}% remaining)")
-    safe_print(f"  Session:  ${status['session_spend']:.4f} / ${status['session_cap']:.2f}")
-    safe_print(f"  All-time: ${status['total_spend_all_time']:.4f}")
-
-    # Vault check
-    safe_print("\nVault")
-    vault_file = _CATO_DIR / "vault.enc"
-    if vault_file.exists():
-        safe_print(f"  OK — {vault_file}")
-    else:
-        safe_print("  Not initialised — run 'cato init'")
-
-    safe_print("")
+    DoctorReport().run()
 
 
 def _cmd_doctor_skills() -> None:

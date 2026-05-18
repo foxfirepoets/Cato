@@ -7,6 +7,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { buildChatMessagePayload, sendChatSocketPayload } from "../lib/chatTransport";
 
 export interface ChatMessage {
   id: string;
@@ -240,13 +241,7 @@ export function useChatStream(wsBase?: string, httpPort?: number, daemonToken?: 
     addMessages([userMsg]);
     setIsStreaming(true);
 
-    wsRef.current.send(
-      JSON.stringify({
-        type:       "message",
-        text,
-        session_id: sessionIdRef.current,
-      }),
-    );
+    sendChatSocketPayload(wsRef.current, buildChatMessagePayload(text, sessionIdRef.current));
   }, [addMessages]);
 
   const clearHistory = useCallback(() => {

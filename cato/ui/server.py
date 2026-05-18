@@ -108,6 +108,8 @@ _DAEMON_TOKEN: str = _load_or_create_daemon_token()
 _TOKEN_EXEMPT_METHODS = {"OPTIONS"}
 # Public read-only endpoints (static HTML pages + health probe)
 _TOKEN_EXEMPT_PATHS = {"/health", "/", "/coding-agent", "/api/activity"}
+# WS paths that authenticate via first-message envelope — bypass pre-flight middleware check
+_TOKEN_EXEMPT_WS_PREFIXES = ("/ws/pty/", "/ws/coding-agent/")
 _LOCAL_REMOTES = {"127.0.0.1", "::1", "localhost"}
 _SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|token|secret|password)(['\"\s:=]+)([^,'\"\s}]+)"),
@@ -140,6 +142,9 @@ async def auth_token_middleware(request: web.Request, handler):
     # /coding-agent/{task_id} serves the SPA shell (static HTML) — no auth needed.
     # The API routes under /api/coding-agent/* remain auth-protected.
     if request.path.startswith("/coding-agent/") and not request.path.startswith("/coding-agent/api"):
+        return await handler(request)
+    # WS endpoints that authenticate via first-message envelope — skip pre-flight check
+    if request.path.startswith(_TOKEN_EXEMPT_WS_PREFIXES):
         return await handler(request)
     token = (request.headers.get("X-Cato-Token", "")
              or request.rel_url.query.get("token", ""))
@@ -212,6 +217,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
                  pages will render but WebSocket will show disconnected state.
     """
     app = web.Application(middlewares=[cors_middleware, auth_token_middleware])
+    app["daemon_token"] = _DAEMON_TOKEN
 
     async def mcp_runtime_ctx(app: web.Application):
         """Start and stop the MCP runtime without blocking desktop startup."""
@@ -955,12 +961,16 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         """GET /api/usage/routing — return model routing decision history."""
         try:
             from cato.router import get_routing_history as _get_history
+            from cato.routing_log import get_routing_log_path
             history = _get_history()
             limit = int(request.rel_url.query.get("limit", "100"))
-            return web.json_response(history[-limit:])
+            return web.json_response({
+                "log_path": str(get_routing_log_path()),
+                "events": history[-limit:],
+            })
         except Exception as exc:
             logger.error("get_routing_history error: %s", exc)
-            return web.json_response([], status=500)
+            return web.json_response({"log_path": "", "events": []}, status=500)
 
     # ------------------------------------------------------------------ #
     # Logs                                                                 #
@@ -1167,19 +1177,28 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         cfg = gateway._cfg
         vault = gateway._vault
 
-        swarm_key = None
-        if vault is not None:
-            swarm_key = vault.get("SWARM_SYNC_API_KEY") or vault.get("SWARMSYNC_API_KEY")
+        from cato.routing_log import get_routing_log_path
+        from cato.swarmsync import swarmsync_key_status
+
+        key_status = swarmsync_key_status(vault)
+        swarm_key = key_status["prefix"]
+        raw_swarm_key = None
+        if key_status["present"]:
+            from cato.swarmsync import get_swarmsync_api_key
+            raw_swarm_key, _ = get_swarmsync_api_key(vault)
         openrouter_key = vault.get("OPENROUTER_API_KEY") if vault else None
 
         status = {
             "swarmsync_enabled": getattr(cfg, "swarmsync_enabled", False),
             "swarmsync_api_url": getattr(cfg, "swarmsync_api_url", ""),
             "default_model": getattr(cfg, "default_model", ""),
-            "swarm_key_present": bool(swarm_key),
-            "swarm_key_prefix": swarm_key[:12] + "..." if swarm_key and len(swarm_key) > 12 else swarm_key,
+            "swarm_key_present": bool(key_status["present"]),
+            "swarm_key_source": key_status["source"],
+            "swarm_key_prefix": swarm_key,
+            "swarm_key_needs_normalization": key_status["needs_normalization"],
             "openrouter_key_present": bool(openrouter_key),
-            "will_use_swarmsync": bool(getattr(cfg, "swarmsync_enabled", False) and swarm_key),
+            "will_use_swarmsync": bool(getattr(cfg, "swarmsync_enabled", False) and key_status["present"]),
+            "persistent_routing_log": str(get_routing_log_path()),
         }
 
         # If SwarmSync is active, do a live test routing call
@@ -1193,7 +1212,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
                     "swarmsync": {"complexity_score": 0.2, "history_length": 1},
                 }
                 headers = {
-                    "Authorization": f"Bearer {swarm_key}",
+                    "Authorization": f"Bearer {raw_swarm_key}",
                     "Content-Type": "application/json",
                 }
                 async with _aiohttp.ClientSession() as s:
@@ -1215,9 +1234,16 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
                             }
                         else:
                             body = await r.text()
-                            status["live_test"] = {"http_status": r.status, "error": body[:200]}
+                            status["live_test"] = {
+                                "http_status": r.status,
+                                "error": body[:200],
+                                "fix": "Verify SWARMSYNC_API_KEY in the Cato vault and SwarmSync service availability.",
+                            }
             except Exception as exc:
-                status["live_test"] = {"error": str(exc)}
+                status["live_test"] = {
+                    "error": str(exc),
+                    "fix": "Check network access, swarmsync_api_url, and the SWARMSYNC_API_KEY vault entry.",
+                }
 
         return web.json_response(status)
 

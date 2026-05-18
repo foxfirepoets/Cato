@@ -21,7 +21,12 @@ Checks performed:
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import socket
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +36,7 @@ from rich.table import Table
 from cato.budget import BudgetManager
 from cato.config import CatoConfig
 from cato.platform import get_data_dir
+from cato.swarmsync import swarmsync_key_status
 
 console = Console()
 
@@ -39,6 +45,7 @@ def _cato_dir() -> Path:
     return get_data_dir()
 
 _PID_FILE = _cato_dir() / "cato.pid"
+_PORT_FILE = _cato_dir() / "cato.port"
 
 # Recommended token ceilings per workspace file
 _TOKEN_LIMITS: dict[str, int] = {
@@ -86,6 +93,10 @@ class DoctorReport:
     def __init__(self, agent_id: Optional[str] = None) -> None:
         self.agent_id = agent_id
         self._config: Optional[CatoConfig] = None
+        self._failures: list[tuple[str, str]] = []
+
+    def _fail(self, problem: str, fix: str) -> None:
+        self._failures.append((problem, fix))
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -104,8 +115,12 @@ class DoctorReport:
         self._check_workspaces()
         self._check_budget()
         self._check_daemon()
+        self._check_desktop_launcher()
+        self._check_swarmsync_key_normalization()
+        self._check_routing_status()
         self._check_channels()
         self._check_browser()
+        self._print_failure_summary()
         console.print()
 
     # ------------------------------------------------------------------
@@ -123,6 +138,7 @@ class DoctorReport:
             console.print(f"  [yellow]LEGACY PATH[/yellow] — config also at {legacy}; current data dir: {data_dir}")
         if not config_path.exists():
             console.print("  [yellow]NOT FOUND[/yellow] — run 'cato init' to create config")
+            self._fail("Config file is missing", "Run: cato init")
             return
         try:
             self._config = CatoConfig.load(config_path)
@@ -132,6 +148,7 @@ class DoctorReport:
                           f"  |  session cap: ${self._config.session_cap:.2f}")
         except Exception as exc:
             console.print(f"  [red]INVALID[/red] — {exc}")
+            self._fail("Config file is invalid", f"Fix YAML at {config_path}: {exc}")
 
     def _check_vault(self) -> None:
         """Check 2: vault file is present."""
@@ -146,6 +163,7 @@ class DoctorReport:
             console.print(
                 "  [yellow]NOT FOUND[/yellow] — run 'cato init' to create vault"
             )
+            self._fail("Vault is missing", "Run: cato init, then store SWARMSYNC_API_KEY in the vault")
 
     def _check_workspaces(self) -> None:
         """Check 3: per-agent workspace file token audit."""
@@ -240,13 +258,203 @@ class DoctorReport:
             console.print(f"  [red]Could not read budget: {exc}[/red]")
 
     def _check_daemon(self) -> None:
-        """Check 5: is the daemon currently running?"""
+        """Check 5: PID/port liveness and /health."""
         console.print("\n[bold]Daemon[/bold]")
+        pid: int | None = None
         if _PID_FILE.exists():
-            pid = _PID_FILE.read_text().strip()
-            console.print(f"  [green]RUNNING[/green]  PID {pid}")
+            raw_pid = _PID_FILE.read_text().strip()
+            try:
+                pid = int(raw_pid)
+            except ValueError:
+                console.print(f"  [red]STALE PID[/red]  invalid pid file: {_PID_FILE}")
+                self._fail("Invalid daemon pid file", f"Delete {_PID_FILE} and restart Cato")
+            else:
+                if self._pid_alive(pid):
+                    console.print(f"  [green]PID OK[/green]  {pid}")
+                else:
+                    console.print(f"  [red]STALE PID[/red]  PID {pid} is not running")
+                    self._fail("Stale daemon pid file", f"Delete {_PID_FILE} and {_PORT_FILE}, then run: cato start --channel webchat")
         else:
             console.print("  [dim]STOPPED[/dim]  (run 'cato start' to launch)")
+            self._fail("Daemon is not running", "Run: cato start --channel webchat")
+
+        port = self._read_port()
+        if port is None:
+            cfg_port = getattr(self._config, "webchat_port", 8080) if self._config else 8080
+            port = int(cfg_port or 8080)
+            console.print(f"  [dim]Port file missing[/dim] — checking configured port {port}")
+        elif not self._port_open(port):
+            console.print(f"  [red]PORT CLOSED[/red]  cato.port says {port}, but nothing is listening")
+            self._fail("Stale daemon port file", f"Delete {_PORT_FILE} and restart with: cato start --channel webchat")
+
+        health = self._get_json(f"http://127.0.0.1:{port}/health", timeout=2)
+        if health.get("ok"):
+            payload = health.get("json", {})
+            console.print(f"  [green]/health OK[/green]  http://127.0.0.1:{port}/health status={payload.get('status')}")
+        else:
+            error = health.get("error", "unknown error")
+            console.print(f"  [red]/health FAIL[/red]  http://127.0.0.1:{port}/health — {error}")
+            self._fail("Daemon /health is unavailable", f"Start or restart daemon, then verify: curl http://127.0.0.1:{port}/health")
+
+    def _check_desktop_launcher(self) -> None:
+        """Check current desktop launcher script and release exe paths."""
+        console.print("\n[bold]Desktop Launcher[/bold]")
+        repo_root = Path(__file__).resolve().parents[1]
+        launcher = repo_root / "Launch-CatoDesktop.ps1"
+        exe = repo_root / "desktop" / "src-tauri" / "target" / "release" / "cato-desktop.exe"
+        shortcut = Path.home() / "Desktop" / "Cato.lnk"
+        if launcher.exists():
+            console.print(f"  [green]Launcher OK[/green]  {launcher}")
+        else:
+            console.print(f"  [red]Launcher missing[/red]  {launcher}")
+            self._fail("Desktop launcher script is missing", f"Restore {launcher} or run desktop\\build_release.ps1")
+        if exe.exists():
+            console.print(f"  [green]Desktop exe OK[/green]  {exe}")
+        else:
+            console.print(f"  [red]Desktop exe missing[/red]  {exe}")
+            self._fail("Desktop executable is missing", "Run: powershell -ExecutionPolicy Bypass -File desktop\\build_release.ps1")
+        if shortcut.exists():
+            console.print(f"  [green]Shortcut present[/green]  {shortcut}")
+        else:
+            console.print(f"  [yellow]Shortcut missing[/yellow]  {shortcut}")
+            self._fail("Desktop shortcut is missing", "Run: powershell -ExecutionPolicy Bypass -File desktop\\build_release.ps1")
+
+    def _check_swarmsync_key_normalization(self) -> None:
+        """Check SwarmSync key aliases that have caused empty-response confusion."""
+        console.print("\n[bold]SwarmSync Key Normalization[/bold]")
+        cfg_enabled = bool(getattr(self._config, "swarmsync_enabled", False)) if self._config else False
+        env_keys = self._read_env_keys()
+        env_new = env_keys.get("SWARMSYNC_API_KEY") or os.environ.get("SWARMSYNC_API_KEY")
+        env_legacy = env_keys.get("SWARM_SYNC_API_KEY") or os.environ.get("SWARM_SYNC_API_KEY")
+        vault_new = vault_legacy = None
+        key_status: dict[str, object] = {"present": False, "source": "", "needs_normalization": False}
+        if os.environ.get("CATO_VAULT_PASSWORD"):
+            try:
+                from cato.vault import get_vault
+                vault = get_vault()
+                key_status = swarmsync_key_status(vault)
+                vault_new = vault.get("SWARMSYNC_API_KEY")
+                vault_legacy = vault.get("SWARM_SYNC_API_KEY")
+            except Exception as exc:
+                console.print(f"  [yellow]Vault key check skipped[/yellow]  {exc}")
+
+        has_key = bool(env_new or env_legacy or vault_new or vault_legacy)
+        console.print(f"  swarmsync_enabled: {'true' if cfg_enabled else 'false'}")
+        console.print(f"  SWARMSYNC_API_KEY present: {'yes' if bool(env_new or vault_new) else 'no'}")
+        console.print(f"  legacy SWARM_SYNC_API_KEY present: {'yes' if bool(env_legacy or vault_legacy) else 'no'}")
+        if key_status.get("present"):
+            console.print(f"  normalized source: {key_status.get('source')}")
+        if cfg_enabled and not has_key:
+            self._fail("SwarmSync is enabled but no key was found", "Set SWARMSYNC_API_KEY in the vault or root .env; do not rely on OpenRouter for routed calls")
+        if key_status.get("needs_normalization") or ((env_legacy or vault_legacy) and not (env_new or vault_new)):
+            self._fail("Only legacy SWARM_SYNC_API_KEY is present", "Normalize to SWARMSYNC_API_KEY in the vault or root .env")
+
+    def _check_routing_status(self) -> None:
+        """Check /api/routing/status from the running daemon."""
+        console.print("\n[bold]Routing Status API[/bold]")
+        port = self._read_port() or int(getattr(self._config, "webchat_port", 8080) if self._config else 8080)
+        token = self._read_daemon_token()
+        result = self._get_json(
+            f"http://127.0.0.1:{port}/api/routing/status",
+            timeout=15,
+            headers={"X-Cato-Token": token} if token else None,
+        )
+        if not result.get("ok"):
+            console.print(f"  [red]FAIL[/red]  {result.get('error')}")
+            self._fail("/api/routing/status is unavailable", f"Restart daemon and check: curl http://127.0.0.1:{port}/api/routing/status")
+            return
+        data = result.get("json", {})
+        live = data.get("live_test") or {}
+        console.print(f"  will_use_swarmsync: {data.get('will_use_swarmsync')}")
+        console.print(f"  key present: {data.get('swarm_key_present')}")
+        if live.get("routed_model"):
+            console.print(f"  [green]live routed model[/green]  {live.get('routed_model')}")
+            console.print(f"  reason: {live.get('routing_reason') or '(not returned)'}")
+            console.print(f"  tier: {live.get('tier') or '(not returned)'}")
+        elif live.get("error"):
+            console.print(f"  [red]live test error[/red]  {live.get('error')}")
+            self._fail("SwarmSync live routing test failed", "Fix SWARMSYNC_API_KEY/connectivity, then re-run: cato doctor")
+
+    def _print_failure_summary(self) -> None:
+        console.print("\n[bold]Failure Summary[/bold]")
+        if not self._failures:
+            console.print("  [green]No blocking failures detected[/green]")
+            return
+        for idx, (problem, fix) in enumerate(self._failures, start=1):
+            console.print(f"  [red]{idx}. {problem}[/red]")
+            console.print(f"     Fix: {fix}")
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _read_port() -> int | None:
+        if not _PORT_FILE.exists():
+            return None
+        try:
+            port = int(_PORT_FILE.read_text().strip())
+            if 0 < port <= 65535:
+                return port
+        except (OSError, ValueError):
+            return None
+        return None
+
+    @staticmethod
+    def _port_open(port: int) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _get_json(url: str, timeout: int, headers: Optional[dict[str, str]] = None) -> dict[str, object]:
+        try:
+            req = urllib.request.Request(url, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(1_000_000).decode("utf-8", errors="replace")
+                return {"ok": 200 <= resp.status < 300, "status": resp.status, "json": json.loads(raw)}
+        except urllib.error.HTTPError as exc:
+            body = exc.read(500).decode("utf-8", errors="replace")
+            return {"ok": False, "status": exc.code, "error": body or str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def _read_daemon_token() -> str:
+        try:
+            return (_cato_dir() / "daemon.token").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _read_env_keys() -> dict[str, str]:
+        repo_root = Path(__file__).resolve().parents[1]
+        keys: dict[str, str] = {}
+        for path in (repo_root / ".env", _cato_dir() / ".env"):
+            if not path.exists():
+                continue
+            try:
+                for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    keys[key.strip()] = value.strip().strip("\"'")
+            except OSError:
+                continue
+        return keys
 
     def _check_channels(self) -> None:
         """Check 6: Telegram / WhatsApp configured."""

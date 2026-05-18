@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import '../styles/SettingsView.css'
 
 interface SettingsTab {
@@ -74,25 +74,32 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
     { id: 'workspace', label: 'Workspace', icon: '📁' },
   ]
 
-  useEffect(() => {
-    loadSettings()
-  }, [activeTab, httpPort])
-
-  const loadSettings = async () => {
+  const loadSettings = useCallback(async () => {
     setLoading(true)
     setError(null)
 
     try {
       switch (activeTab) {
-        case 'memory':
+        case 'general': {
+          const configRes = await fetch(`${base}/api/config`)
+          if (configRes.ok) {
+            const data = await configRes.json()
+            setDefaultModel(data.default_model || '')
+            setWorkspacePath(data.workspace_dir || '')
+          }
+          break
+        }
+
+        case 'memory': {
           const memRes = await fetch(`${base}/api/memory/stats`)
           if (memRes.ok) {
             const data = await memRes.json()
             setMemoryStats(data.stats)
           }
           break
+        }
 
-        case 'channels':
+        case 'channels': {
           const [whatsRes, integrationsRes] = await Promise.all([
             fetch(`${base}/api/whatsapp/config`),
             fetch(`${base}/api/integrations/status`),
@@ -106,8 +113,9 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
             setIntegrations(data)
           }
           break
+        }
 
-        case 'workspace':
+        case 'workspace': {
           const configRes = await fetch(`${base}/api/config`)
           if (configRes.ok) {
             const data = await configRes.json()
@@ -115,13 +123,18 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
             setDefaultModel(data.default_model || '')
           }
           break
+        }
       }
     } catch (err) {
       setError(`Failed to load ${activeTab} settings: ${err instanceof Error ? err.message : 'Unknown error'}`)
     } finally {
       setLoading(false)
     }
-  }
+  }, [activeTab, base])
+
+  useEffect(() => {
+    void loadSettings()
+  }, [loadSettings])
 
   const handleReindexMemory = async () => {
     setLoading(true)
@@ -152,8 +165,8 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          workspace_dir: workspacePath,
-          default_model: defaultModel,
+          ...(workspacePath ? { workspace_dir: workspacePath } : {}),
+          ...(defaultModel ? { default_model: defaultModel } : {}),
         }),
       })
 

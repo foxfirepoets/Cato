@@ -60,6 +60,7 @@ export function useTalkPageStream(
   const closedRef         = useRef<boolean>(false);
   const messagesRef       = useRef<TalkMessage[]>([]);
   const synthesisRef      = useRef<SynthesisResult | null>(null);
+  const connectRef        = useRef<() => void>(() => {});
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -67,7 +68,7 @@ export function useTalkPageStream(
 
   useEffect(() => {
     synthesisRef.current = synthesis;
-  }, []);  // synthesisRef keeps this stable without synthesis in deps
+  }, [synthesis]);
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -115,7 +116,7 @@ export function useTalkPageStream(
       }
       setIsLoading(false);
     }, TASK_TIMEOUT_MS);
-  }, [synthesis]);
+  }, []);
 
   const clearTaskTimeout = useCallback(() => {
     if (taskTimerRef.current) {
@@ -231,14 +232,14 @@ export function useTalkPageStream(
     const rawHost = wsBase ?? "127.0.0.1:8080";
     const host = /^127\.0\.0\.1:\d+$/.test(rawHost) ? rawHost : "127.0.0.1:8080";
     const token = daemonToken || (window as Window & { __CATO_DAEMON_TOKEN__?: string }).__CATO_DAEMON_TOKEN__;
-    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
-    const url  = `ws://${host}/ws/coding-agent/${encodeURIComponent(taskId)}${qs}`;
+    const url  = `ws://${host}/ws/coding-agent/${encodeURIComponent(taskId)}`;
 
     setConnectionStatus("connecting");
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (token) ws.send(JSON.stringify({ type: "auth", token }));
       setConnectionStatus("connected");
       retriesRef.current = 0;
       resetHeartbeatTimer();
@@ -266,7 +267,7 @@ export function useTalkPageStream(
         );
         retriesRef.current += 1;
         setConnectionStatus("reconnecting");
-        setTimeout(connect, delay);
+        setTimeout(() => connectRef.current(), delay);
       } else {
         setConnectionStatus("disconnected");
         setIsLoading(false);
@@ -279,10 +280,17 @@ export function useTalkPageStream(
   ]);
 
   useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
+
+  useEffect(() => {
     closedRef.current = false;
     retriesRef.current = 0;
-    connect();
+    const initialConnect = setTimeout(() => {
+      connectRef.current();
+    }, 0);
     return () => {
+      clearTimeout(initialConnect);
       closedRef.current = true;
       clearHeartbeatTimer();
       clearTaskTimeout();
@@ -292,8 +300,7 @@ export function useTalkPageStream(
         wsRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId]);
+  }, [taskId, connect, clearHeartbeatTimer, clearTaskTimeout]);
 
   const cancel = useCallback(() => {
     closedRef.current = true;

@@ -16,9 +16,22 @@ interface LogEntry {
 
 interface RoutingEntry {
   ts: number;
+  timestamp?: string;
+  request_id?: string;
   routed_model: string;
+  chosen_model?: string;
   raw_model: string;
+  routing_reason?: string;
+  tier?: string;
+  considered_models?: string[];
+  estimated_cost?: number | string | null;
+  actual_cost?: number | string | null;
+  fallback_routing?: boolean;
+  success?: boolean;
+  status?: string;
+  error?: string;
   complexity: number;
+  complexity_score?: number;
   has_tools: boolean;
   msg_count: number;
 }
@@ -143,6 +156,7 @@ const DaemonLogsTab: React.FC<{ base: string }> = ({ base }) => {
 /* ── Model Routing Tab ── */
 const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
   const [entries, setEntries] = useState<RoutingEntry[]>([]);
+  const [logPath, setLogPath] = useState("");
   const [loading, setLoading] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
 
@@ -150,7 +164,13 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
     try {
       const r = await fetch(`${base}/api/usage/routing?limit=100`);
       const data = await r.json();
-      setEntries(Array.isArray(data) ? data : []);
+      if (Array.isArray(data)) {
+        setEntries(data);
+        setLogPath("");
+      } else {
+        setEntries(Array.isArray(data.events) ? data.events : []);
+        setLogPath(data.log_path || "");
+      }
     } catch { /* silent */ }
     finally { setLoading(false); }
   }, [base]);
@@ -167,7 +187,7 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
   // Compute model frequency summary
   const modelCounts: Record<string, number> = {};
   entries.forEach((e) => {
-    const label = formatModel(e.routed_model);
+    const label = formatModel(e.routed_model || e.chosen_model || "");
     modelCounts[label] = (modelCounts[label] || 0) + 1;
   });
   const sorted = Object.entries(modelCounts).sort((a, b) => b[1] - a[1]);
@@ -181,6 +201,11 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
         </label>
         <button className="btn-secondary" onClick={fetch_}>Refresh</button>
       </div>
+      {logPath && (
+        <div style={{ marginBottom: 12, fontSize: 12, color: "var(--text-muted, #64748b)", overflowWrap: "anywhere" }}>
+          Persistent log: <code>{logPath}</code>
+        </div>
+      )}
 
       {/* Model frequency summary */}
       {sorted.length > 0 && (
@@ -216,7 +241,12 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
             <thead>
               <tr style={{ borderBottom: "1px solid var(--border-secondary, #2a2a3e)", textAlign: "left" }}>
                 <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Time</th>
+                <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Request</th>
                 <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Model</th>
+                <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Why</th>
+                <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Considered</th>
+                <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Cost</th>
+                <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>State</th>
                 <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Complexity</th>
                 <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Tools</th>
                 <th style={{ padding: "8px 10px", color: "var(--text-muted, #64748b)" }}>Messages</th>
@@ -226,18 +256,48 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
               {[...entries].reverse().map((e, i) => (
                 <tr key={i} style={{ borderBottom: "1px solid var(--border-secondary, #1a1a2e)" }}>
                   <td style={{ padding: "6px 10px", fontFamily: "monospace", fontSize: 12, color: "var(--text-muted, #64748b)" }}>
-                    {new Date(e.ts * 1000).toLocaleTimeString()}
+                    {e.timestamp ? new Date(e.timestamp).toLocaleString() : new Date(e.ts * 1000).toLocaleTimeString()}
+                  </td>
+                  <td style={{ padding: "6px 10px", fontFamily: "monospace", fontSize: 11, color: "var(--text-muted, #64748b)" }}>
+                    {(e.request_id || "-").slice(0, 12)}
                   </td>
                   <td style={{ padding: "6px 10px" }}>
                     <span style={{
                       display: "inline-block", padding: "2px 8px", borderRadius: 6,
                       fontSize: 12, fontWeight: 600,
-                      background: `${getModelColor(e.routed_model)}18`,
-                      color: getModelColor(e.routed_model),
-                      border: `1px solid ${getModelColor(e.routed_model)}44`,
+                      background: `${getModelColor(e.routed_model || e.chosen_model || "")}18`,
+                      color: getModelColor(e.routed_model || e.chosen_model || ""),
+                      border: `1px solid ${getModelColor(e.routed_model || e.chosen_model || "")}44`,
                     }}>
-                      {formatModel(e.routed_model)}
+                      {formatModel(e.routed_model || e.chosen_model || "")}
                     </span>
+                  </td>
+                  <td style={{ padding: "6px 10px", maxWidth: 240, fontSize: 12, color: "var(--text-muted, #64748b)" }}>
+                    <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={e.routing_reason || ""}>
+                      {e.routing_reason || "-"}
+                    </div>
+                    {e.tier && <div style={{ color: "#60a5fa", fontSize: 11 }}>{e.tier}</div>}
+                  </td>
+                  <td style={{ padding: "6px 10px", maxWidth: 220, fontSize: 12, color: "var(--text-muted, #64748b)" }}>
+                    <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={(e.considered_models || []).join(", ")}>
+                      {(e.considered_models || []).join(", ") || "-"}
+                    </div>
+                  </td>
+                  <td style={{ padding: "6px 10px", fontFamily: "monospace", fontSize: 12, color: "var(--text-muted, #64748b)" }}>
+                    est {e.estimated_cost ?? "-"}<br />
+                    act {e.actual_cost ?? "-"}
+                  </td>
+                  <td style={{ padding: "6px 10px", fontSize: 12 }}>
+                    <span style={{
+                      display: "inline-block", padding: "2px 7px", borderRadius: 6, fontWeight: 700,
+                      color: e.success ? "#86efac" : "#fca5a5",
+                      background: e.success ? "#14532d44" : "#7f1d1d44",
+                      border: `1px solid ${e.success ? "#15803d" : "#ef4444"}`,
+                    }}>
+                      {e.success ? "OK" : "FAIL"}
+                    </span>
+                    {e.fallback_routing && <div style={{ marginTop: 4, color: "#fcd34d" }}>fallback</div>}
+                    {e.error && <div style={{ marginTop: 4, color: "#fca5a5", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={e.error}>{e.error}</div>}
                   </td>
                   <td style={{ padding: "6px 10px" }}>
                     <span style={{
@@ -246,12 +306,12 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
                     }}>
                       <span style={{
                         position: "absolute", left: 0, top: 0, height: "100%", borderRadius: 3,
-                        width: `${Math.min(e.complexity * 100, 100)}%`,
-                        background: e.complexity > 0.7 ? "#ef4444" : e.complexity > 0.4 ? "#eab308" : "#22c55e",
+                        width: `${Math.min((e.complexity_score ?? e.complexity) * 100, 100)}%`,
+                        background: (e.complexity_score ?? e.complexity) > 0.7 ? "#ef4444" : (e.complexity_score ?? e.complexity) > 0.4 ? "#eab308" : "#22c55e",
                       }} />
                     </span>
                     <span style={{ marginLeft: 6, fontSize: 11, color: "var(--text-muted, #64748b)" }}>
-                      {(e.complexity * 100).toFixed(0)}%
+                      {((e.complexity_score ?? e.complexity) * 100).toFixed(0)}%
                     </span>
                   </td>
                   <td style={{ padding: "6px 10px", color: e.has_tools ? "#22c55e" : "var(--text-muted, #64748b)", fontSize: 12 }}>

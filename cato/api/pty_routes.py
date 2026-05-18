@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 
 from aiohttp import web, WSMsgType
 
@@ -172,8 +173,27 @@ async def pty_websocket_handler(request: web.Request) -> web.StreamResponse:
     if not session:
         return web.json_response({"error": "Session not found"}, status=404)
 
+    daemon_token: str = request.app.get("daemon_token", "")
+
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+
+    # Authenticate: only required when daemon_token is configured.
+    if daemon_token:
+        token = (request.headers.get("X-Cato-Token", "")
+                 or request.rel_url.query.get("token", ""))
+        if not token:
+            try:
+                first_msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+                if first_msg.type == WSMsgType.TEXT:
+                    parsed = json.loads(first_msg.data)
+                    if parsed.get("type") == "auth":
+                        token = str(parsed.get("token") or "")
+            except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+                pass
+        if not secrets.compare_digest(token, daemon_token):
+            await ws.close(code=4401, message=b"Unauthorized")
+            return ws
 
     async def send_output(chunk: bytes) -> None:
         try:

@@ -177,7 +177,7 @@ function renderView(view: View, daemon: DaemonInfo, onNavigate: (v: View) => voi
     case "system":
       return <SystemView httpPort={httpPort} />;
     case "diagnostics":
-      return <DiagnosticsView httpPort={httpPort} />;
+      return <DiagnosticsView httpPort={httpPort} wsPort={wsPort} daemonToken={daemon.daemonToken} />;
     default:
       return null;
   }
