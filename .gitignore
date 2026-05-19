@@ -17,6 +17,14 @@ venv/
 vault.enc
 *.log
 .pytest_cache/
+.pytest_cache_tmp/
+_pytest_out.txt
+_pytest_err.txt
+_pytest_pid.txt
+_run_pytest.ps1
+.pytest_full.out
+.pytest_full.err
+.run_pytest.bat
 .coverage
 htmlcov/
 Capture.PNG

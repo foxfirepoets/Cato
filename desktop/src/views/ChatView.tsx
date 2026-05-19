@@ -4,7 +4,9 @@
 
 import React, { useState, useRef, useEffect, useCallback, type FormEvent } from "react";
 import { useChatStream, type ChatMessage, type ChatConnectionStatus } from "../hooks/useChatStream";
+import { useProgressStream } from "../hooks/useProgressStream";
 import { ActivityIndicator } from "../components/ActivityIndicator";
+import { ProgressFeed } from "../components/ProgressFeed";
 import logoSrc from "../assets/cato-logo.png";
 
 interface ChatViewProps {
@@ -155,6 +157,10 @@ const FileChip: React.FC<{ file: UploadedFile; onRemove: () => void }> = ({ file
 export const ChatView: React.FC<ChatViewProps> = ({ wsBase, httpPort, daemonToken, onConnectionStatusChange }) => {
   const { messages, connectionStatus, sendMessage, isStreaming, clearHistory, wsRef } =
     useChatStream(wsBase, httpPort, daemonToken);
+  // Claude-Code-style live work feed — listens for the gateway's `progress`
+  // WS events and exposes a structured per-turn view.  Renders as a ghost
+  // assistant bubble while a session is active; cleared on session_end.
+  const { state: progressState, reset: resetProgress } = useProgressStream(wsRef);
   const [input, setInput] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<UploadedFile[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -227,12 +233,15 @@ export const ChatView: React.FC<ChatViewProps> = ({ wsBase, httpPort, daemonToke
         fullText = fileRefs + (text ? "\n\n" + text : "\n\nPlease review the attached file(s).");
       }
 
+      // Reset the live work feed so the new turn starts from an empty
+      // ghost bubble; the gateway will repopulate it via WS `progress` events.
+      resetProgress();
       sendMessage(fullText);
       setInput("");
       setAttachedFiles([]);
       inputRef.current?.focus();
     },
-    [input, attachedFiles, sendMessage],
+    [input, attachedFiles, sendMessage, resetProgress],
   );
 
   const handleKeyDown = useCallback(
@@ -315,15 +324,27 @@ export const ChatView: React.FC<ChatViewProps> = ({ wsBase, httpPort, daemonToke
         {messages.map((msg) => (
           <ChatBubble key={msg.id} message={msg} />
         ))}
-        {isStreaming && (
-          <div className="chat-bubble chat-bubble-assistant">
-            <div className="chat-bubble-header">
-              <span className="chat-bubble-role">Cato</span>
+        {/*
+          Claude-Code-style live feed.  Visible while a session is active
+          (progressState.active), or while local isStreaming flag is set but
+          no progress events have arrived yet (e.g. very first turn before
+          the agent loop emits turn_start).  Falls back to the existing
+          three-dot typing indicator in the latter case so the user still
+          sees *something* immediately.
+        */}
+        {progressState.active || progressState.turns.length > 0 ? (
+          <ProgressFeed state={progressState} hidden={false} />
+        ) : (
+          isStreaming && (
+            <div className="chat-bubble chat-bubble-assistant">
+              <div className="chat-bubble-header">
+                <span className="chat-bubble-role">Cato</span>
+              </div>
+              <div className="chat-typing">
+                <span /><span /><span />
+              </div>
             </div>
-            <div className="chat-typing">
-              <span /><span /><span />
-            </div>
-          </div>
+          )
         )}
         <div ref={messagesEndRef} />
       </div>

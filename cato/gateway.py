@@ -272,13 +272,288 @@ class Gateway:
                 "channel": channel,
                 "role": "user",
             })
+
+        # Slash-command dispatch — runs before the agent loop so the lane
+        # queue is not consumed by short-circuit commands like /compact.
+        resolved_agent_id = agent_id or self._cfg.agent_name
+        if message.startswith("/"):
+            try:
+                handled = await self._handle_slash_command(
+                    session_id, message, channel, resolved_agent_id,
+                )
+            except Exception as exc:
+                logger.error("Slash command failed: %s", exc, exc_info=True)
+                await self.send(
+                    session_id,
+                    f"[slash command error: {exc}]",
+                    channel,
+                )
+                handled = True
+            if handled:
+                return
+
         lane = self._get_or_create_lane(session_id)
         await lane.enqueue({
             "session_id": session_id,
             "message":    message,
             "channel":    channel,
-            "agent_id":   agent_id or self._cfg.agent_name,
+            "agent_id":   resolved_agent_id,
         })
+
+    # ------------------------------------------------------------------
+    # Slash command dispatch (parity with Claude Code's /compact, /help)
+    # ------------------------------------------------------------------
+
+    async def _handle_slash_command(
+        self, session_id: str, text: str, channel: str, agent_id: str,
+    ) -> bool:
+        """Handle ``/commands`` typed in chat.
+
+        Returns True when a command was matched (and a response already
+        delivered through ``self.send``).  Returns False to let the
+        message fall through to the normal agent loop — useful when the
+        leading slash is actually meaningful content (e.g. ``/path/to``).
+        """
+        body = text[1:]  # strip leading '/'
+        cmd, _, rest = body.partition(" ")
+        cmd = cmd.lower().strip()
+        rest = rest.strip()
+
+        if cmd == "compact":
+            await self._cmd_compact(session_id, channel, agent_id, rest)
+            return True
+        if cmd == "help":
+            await self._cmd_help(session_id, channel)
+            return True
+
+        # Heuristic: only treat as an unknown command when it looks like
+        # one (alphabetic, no whitespace before the slash, ≤ 32 chars).
+        # Bare paths like ``/usr/bin/foo`` flow through to the agent loop.
+        if cmd and cmd.replace("_", "").replace("-", "").isalpha() and len(cmd) <= 32:
+            await self.send(
+                session_id,
+                f"Unknown command: /{cmd}. Try /help to see available slash commands.",
+                channel,
+            )
+            return True
+        return False
+
+    async def _cmd_help(self, session_id: str, channel: str) -> None:
+        """Send the slash-command help text."""
+        text = (
+            "Slash commands:\n"
+            "  /compact - summarize older conversation turns to free up context\n"
+            "  /help    - show this list"
+        )
+        await self.send(session_id, text, channel)
+
+    async def _cmd_compact(
+        self, session_id: str, channel: str, agent_id: str, args: str,
+    ) -> None:
+        """Compact the on-disk transcript for *session_id* via the LLM.
+
+        Optional positional argument: a positive integer ``keep_recent``
+        overriding the default of 8.  ``/compact 4`` keeps only the last
+        four user turns verbatim.
+        """
+        # Defer the heavy imports until first invocation so the gateway
+        # module stays lean at startup.
+        from .agent_loop import (
+            HISTORY_WINDOW,  # noqa: F401 — exported for parity with the agent loop
+            _now,
+            _sanitize_agent_id,
+            _transcript_path,
+        )
+        from .core.compactor import (
+            DEFAULT_KEEP_RECENT,
+            compact_session,
+        )
+
+        keep_recent = DEFAULT_KEEP_RECENT
+        if args:
+            try:
+                parsed = int(args.split()[0])
+                if parsed > 0:
+                    keep_recent = parsed
+            except ValueError:
+                pass
+
+        # Lazily ensure the agent loop is initialised so we can borrow
+        # its model router for the summarisation call.
+        await self._ensure_agent_loop()
+        if self._agent_loop is None:
+            await self.send(
+                session_id,
+                "[compact: agent loop unavailable]",
+                channel,
+            )
+            return
+
+        safe_agent_id = _sanitize_agent_id(agent_id)
+        tpath = _transcript_path(safe_agent_id, session_id)
+        if not tpath.exists():
+            await self.send(
+                session_id,
+                "Nothing to compact - no transcript on disk for this session yet.",
+                channel,
+            )
+            return
+
+        # Load transcript JSONL into the message-dict shape compact_session expects
+        try:
+            raw = await asyncio.get_running_loop().run_in_executor(
+                None, tpath.read_text, "utf-8",
+            )
+        except OSError as exc:
+            await self.send(
+                session_id,
+                f"[compact: could not read transcript: {exc}]",
+                channel,
+            )
+            return
+
+        messages: list[dict] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            role = rec.get("role")
+            if role == "user":
+                messages.append({"role": "user", "content": rec.get("content", "")})
+            elif role == "assistant":
+                msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": rec.get("content", ""),
+                }
+                if rec.get("tool_calls"):
+                    msg["tool_calls"] = rec["tool_calls"]
+                messages.append(msg)
+            elif role == "tool":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": rec.get("tool_call_id", "unknown"),
+                    "content": rec.get("result", rec.get("content", "")),
+                })
+
+        if not messages:
+            await self.send(
+                session_id,
+                "Nothing to compact - transcript is empty.",
+                channel,
+            )
+            return
+
+        # Wrap the router as the simple llm_call(system_prompt, user_prompt, model)
+        # callable the compactor expects.  Stream the response and concatenate.
+        agent_loop = self._agent_loop
+
+        async def _llm_wrapper(*, system_prompt: str, user_prompt: str,
+                               model: str | None = None) -> str:
+            llm_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ]
+            chosen_model = model or self._cfg.default_model
+            chunks: list[str] = []
+            async for chunk in agent_loop._router.complete(
+                llm_messages, chosen_model, tools=None, stream=True,
+            ):
+                if isinstance(chunk, str):
+                    chunks.append(chunk)
+            return "".join(chunks)
+
+        await self._broadcast_activity(True, session_id, "compacting history")
+        try:
+            new_messages, result = await compact_session(
+                messages=messages,
+                llm_call=_llm_wrapper,
+                keep_recent=keep_recent,
+            )
+        finally:
+            await self._broadcast_activity(False, session_id, "")
+
+        if result.compacted_count == 0:
+            await self.send(
+                session_id,
+                (
+                    f"Nothing to compact - only {len(messages)} messages on file, "
+                    f"keep_recent={keep_recent}."
+                ),
+                channel,
+            )
+            return
+
+        # Persist the compacted history back to disk.  We rewrite as JSONL,
+        # mapping the synthetic summary system message into a record the
+        # agent loop's _recent_turns() will surface on the next turn.
+        new_records: list[dict] = []
+        for m in new_messages:
+            role = m.get("role")
+            ts = _now()
+            if role == "system":
+                # Stored as an assistant turn tagged with [compacted-summary]
+                # so it shows up in _recent_turns() without breaking any
+                # tool_call pairing.  The marker keeps it identifiable.
+                new_records.append({
+                    "ts": ts,
+                    "role": "assistant",
+                    "content": (
+                        "[compacted-summary]\n" + str(m.get("content", ""))
+                    ),
+                    "session_id": session_id,
+                })
+            elif role == "tool":
+                new_records.append({
+                    "ts": ts,
+                    "role": "tool",
+                    "tool_call_id": m.get("tool_call_id", "unknown"),
+                    "result": m.get("content", ""),
+                    "session_id": session_id,
+                })
+            else:
+                rec: dict[str, Any] = {
+                    "ts": ts,
+                    "role": role or "user",
+                    "content": m.get("content", ""),
+                    "session_id": session_id,
+                }
+                if m.get("tool_calls"):
+                    rec["tool_calls"] = m["tool_calls"]
+                new_records.append(rec)
+
+        try:
+            new_content = "\n".join(
+                json.dumps(r, ensure_ascii=True) for r in new_records
+            ) + "\n"
+            await asyncio.get_running_loop().run_in_executor(
+                None, tpath.write_text, new_content, "utf-8",
+            )
+        except OSError as exc:
+            await self.send(
+                session_id,
+                f"[compact: could not rewrite transcript: {exc}]",
+                channel,
+            )
+            return
+
+        ratio = (
+            (100 * result.compacted_tokens // max(result.original_tokens, 1))
+            if result.original_tokens else 0
+        )
+        await self.send(
+            session_id,
+            (
+                f"Compacted {result.compacted_count} messages into a summary. "
+                f"Kept {result.kept_count} entries in the new history. "
+                f"Context: {result.original_tokens} -> {result.compacted_tokens} tokens "
+                f"({ratio}% of original, {result.elapsed_s:.1f}s)."
+            ),
+            channel,
+        )
 
     async def request_response(
         self,
@@ -1074,6 +1349,7 @@ class Gateway:
             config=self._cfg, budget=self._budget, vault=self._vault,
             memory=memory, context_builder=ctx,
             on_tool_progress=self._on_tool_progress,
+            on_progress_event=self._on_progress_event,
         )
         register_all_tools(loop)  # shell, file, memory, browser (Conduit when conduit_enabled)
         register_conduit_web_tools(loop.register_tool, self._cfg)  # web.search, web.code, etc. with config
@@ -1107,3 +1383,22 @@ class Gateway:
             "current_tool": self._activity_state.get("current_tool"),
             "tool_started_at": self._activity_state.get("tool_started_at"),
         })
+
+    # ------------------------------------------------------------------ #
+    # Claude-Code-style live work feed                                   #
+    # ------------------------------------------------------------------ #
+    async def _on_progress_event(self, event: dict) -> None:
+        """Broadcast a structured progress event over the WebSocket.
+
+        The agent loop emits 8 event kinds (turn_start, llm_start,
+        llm_token, llm_end, tool_start, tool_end, turn_end, session_end)
+        which the desktop ProgressFeed renders as a live work indicator.
+
+        Broadcasts are best-effort: dead clients are pruned in
+        ``_ws_broadcast`` itself.  Never raises (the agent loop relies
+        on the emitter swallowing callback errors).
+        """
+        try:
+            await self._ws_broadcast(event)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("progress event broadcast failed: %s", exc)

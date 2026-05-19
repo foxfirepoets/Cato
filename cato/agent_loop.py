@@ -40,6 +40,7 @@ from .config import CatoConfig
 from .core.context_builder import ContextBuilder
 from .core.memory import MemorySystem
 from .platform import get_data_dir
+from .progress import ProgressCallback, ProgressEmitter
 from .router import ModelRouter
 from .safety import SafetyGuard
 from .swarmsync import get_swarmsync_api_key
@@ -1329,6 +1330,7 @@ class AgentLoop:
         audit_log: Optional[AuditLog] = None,
         safety_guard: Optional[SafetyGuard] = None,
         on_tool_progress: Optional[Callable[[str, str, str], Any]] = None,
+        on_progress_event: Optional[ProgressCallback] = None,
     ) -> None:
         self._cfg = config
         self._budget = budget
@@ -1345,6 +1347,12 @@ class AgentLoop:
         # large greps, etc.) instead of just "Working".  Async or sync
         # callbacks both supported.
         self._on_tool_progress = on_tool_progress
+        # Claude-Code-style streaming progress events.  Callback receives a
+        # single dict per event and may be sync or async.  Construct a per-
+        # session ProgressEmitter inside run() so concurrent sessions do not
+        # share state.  When `on_progress_event` is None all emits are
+        # cheap no-ops (the emitter checks the callback up-front).
+        self._on_progress_event: Optional[ProgressCallback] = on_progress_event
         self._router = ModelRouter(
             vault=vault,
             preferred_model=config.default_model,
@@ -1419,6 +1427,13 @@ class AgentLoop:
         Raises BudgetExceeded if spend caps are breached.
         """
         self._continuation_retried = False  # reset per-invocation flag
+        # Per-session progress emitter — gateway-supplied callback fans
+        # the 8-event stream out over WebSocket.  When no callback was
+        # configured all emits are cheap no-ops.
+        self._progress = ProgressEmitter(
+            session_id=session_id, on_event=self._on_progress_event
+        )
+        _planning_turns_completed = 0
 
         # Start periodic audit verification on first run
         if self._audit_verify_task is None or self._audit_verify_task.done():
@@ -1507,218 +1522,263 @@ class AgentLoop:
         final_text = ""
         total_cost = 0.0
 
-        while True:
-            if planning_turns >= self._cfg.max_planning_turns:
-                messages.append({
-                    "role": "system",
-                    "content": "Provide your final answer now. No more tool calls.",
-                })
-
-            # Budget pre-flight using actual input token count
-            try:
-                input_tokens = self._ctx.count_tokens("\n".join(
-                    m.get("content", "") for m in messages if isinstance(m.get("content"), str)
-                ))
-                await self._budget.check_and_deduct(
-                    model,
-                    input_tokens,
-                    input_tokens // 3,
-                    allow_over_budget=_budget_bypass_requested(message),
-                )
-                call_cost = self._budget._last_call_cost
-            except BudgetExceeded as exc:
-                raise BudgetExceeded(
-                    (
-                        f"{exc} This is a warning gate, not a permanent stop. "
-                        "Reply with 'continue anyway' or 'bypass budget' to run this turn "
-                        "and record the spend as a budget override."
-                    ),
-                    cap_type=exc.cap_type,
-                    cap_value=exc.cap_value,
-                    current=exc.current,
-                    call_cost=exc.call_cost,
-                ) from exc
-            except Exception:
-                call_cost = 0.0
-            total_cost += call_cost
-
-            force = planning_turns >= self._cfg.max_planning_turns
-
-            # Route every turn through SwarmSync when enabled — no direct
-            # OpenRouter calls.  Falls back to _stream_collect only when
-            # SwarmSync is disabled or returns empty.
-            text = ""
-            tool_calls: list[ToolCall] = []
-            used_swarmsync = False
-
-            if use_swarmsync and not force:
-                try:
-                    # Sanitize tool names in message history so they match the
-                    # sanitized tool definitions we send to SwarmSync.  Without
-                    # this, the API rejects tool results referencing tool names
-                    # that don't appear in the tool definitions.
-                    swarm_messages = _sanitize_messages_for_api(messages)
-                    if planning_turns > 0:
-                        _msg_summary = []
-                        for _m in swarm_messages:
-                            _r = _m.get("role", "?")
-                            if _r == "assistant" and _m.get("tool_calls"):
-                                _tc_info = [tc.get("function", {}).get("name", "?") for tc in _m["tool_calls"]]
-                                _msg_summary.append(f"assistant(tc={_tc_info})")
-                            elif _r == "tool":
-                                _msg_summary.append(f"tool(id={_m.get('tool_call_id', '?')[:15]})")
-                            else:
-                                _msg_summary.append(_r)
-                        logger.info("SwarmSync msg structure: %s", _msg_summary)
-                    # BUG FIX BH-002b: Per-turn SwarmSync timeout (45s) so one
-                    # slow API call doesn't eat the entire 180s gateway budget.
-                    if hasattr(self._router, "_swarmsync_complete_message"):
-                        routed_model, swarm_response = await asyncio.wait_for(
-                            self._router._swarmsync_complete_message(
-                                swarm_messages, swarm_key, complexity, tools=_tools_for_swarm,
-                            ),
-                            timeout=50,
-                        )
-                    else:
-                        routed_model, swarm_response = await asyncio.wait_for(
-                            self._router._swarmsync_complete(
-                                swarm_messages, swarm_key, complexity,
-                            ),
-                            timeout=50,
-                        )
-                    if not isinstance(swarm_response, dict):
-                        swarm_response = {"role": "assistant", "content": swarm_response or ""}
-                    model = routed_model
-                    logger.info(
-                        "SwarmSync turn=%d keys=%s has_tool_calls=%s content_len=%d model=%s",
-                        planning_turns,
-                        list(swarm_response.keys()),
-                        "tool_calls" in swarm_response,
-                        len(swarm_response.get("content", "") or ""),
-                        model,
-                    )
-                    text = swarm_response.get("content", "") or ""
-                    tool_calls = _parse_tool_calls_openai(swarm_response)
-                    tool_calls.extend(_parse_tool_calls_text(text))
-                    text = _strip_tool_call_blocks(text)
-                    # Reverse-map sanitized tool names back to dotted originals
-                    for tc in tool_calls:
-                        if tc.name in _swarm_name_map:
-                            tc.name = _swarm_name_map[tc.name]
-                    logger.info(
-                        "SwarmSync parsed: text_len=%d tool_calls=%d names=%s text_repr=%r",
-                        len(text), len(tool_calls),
-                        [tc.name for tc in tool_calls] if tool_calls else "[]",
-                        _scrub_secrets(text[:200]) if text else "",
-                    )
-                    if text or tool_calls:
-                        used_swarmsync = True
-                except Exception as exc:
-                    logger.warning("SwarmSync turn %d failed: %s — falling back to _stream_collect", planning_turns, exc)
-
-            if not used_swarmsync:
-                logger.info("Using _stream_collect (turn=%d, swarmsync=%s)", planning_turns, use_swarmsync)
-                text, tool_calls = await self._stream_collect(messages, model, force)
-
-            _ensure_tool_call_ids(tool_calls, planning_turns)
-            await _aappend(tpath, {
-                "ts": _now(), "role": "assistant", "content": text,
-                "tool_calls": [_tool_call_to_openai(tc) for tc in tool_calls],
-                "cost_usd": call_cost, "model": model, "session_id": session_id,
-            })
-            messages.append(_assistant_message_with_tool_calls(text, tool_calls))
-
-            if not tool_calls or force:
-                # Detect "phantom action" — model described doing something but
-                # never emitted a tool_call.  Re-prompt once so it actually
-                # executes instead of just narrating.
-                _ACTION_HINTS = (
-                    "i'll ", "i will ", "let me ", "i'm going to ",
-                    "i am going to ", "let's ", "i can ",
-                    "i'll now ", "let me now ",
-                )
-                _text_lower = (text or "").lower()
-                if (
-                    not force
-                    and planning_turns == 0
-                    and any(h in _text_lower for h in _ACTION_HINTS)
-                    and not getattr(self, "_continuation_retried", False)
-                ):
-                    logger.warning(
-                        "Phantom action detected — model described actions without "
-                        "tool_calls. Re-prompting with continuation."
-                    )
-                    self._continuation_retried = True
+        # Wrap the entire planning loop in try/finally so the progress
+        # `session_end` fires on every exit path — success, BudgetExceeded,
+        # asyncio.TimeoutError, or any other exception.  This is the
+        # backend half of the "stuck on Working… forever" fix: without
+        # the finally, an exception inside the loop would leave the
+        # desktop pill amber until the next message.
+        try:
+            while True:
+                if planning_turns >= self._cfg.max_planning_turns:
                     messages.append({
-                        "role": "user",
-                        "content": (
-                            "You described what you would do but did not actually "
-                            "call any tools. Please use the available tools to "
-                            "execute the actions now — do not just describe them."
-                        ),
+                        "role": "system",
+                        "content": "Provide your final answer now. No more tool calls.",
                     })
-                    planning_turns += 1
-                    continue
-                final_text = text
-                break
 
-            planning_turns += 1
-            for tc in tool_calls:
-                # Resolve hallucinated/short tool names before dispatch
-                tc.name = _resolve_tool_name(tc.name)
-                if tc.error or not tc.name or not isinstance(tc.args, dict) or tc.name not in _TOOL_REGISTRY:
-                    result = await self._dispatch_with_progress(tc)
-                # Safety gate: check before every tool call
-                elif self._safety and not self._safety.check_and_confirm(tc.name, tc.args):
-                    error_msg = f"[SAFETY] Action '{tc.name}' denied by safety guard."
-                    logger.warning(error_msg)
-                    if self._audit_log:
-                        self._audit_log.log(
-                            session_id, "error", tc.name, tc.args, {},
-                            error=error_msg,
-                        )
-                    result = json.dumps({"error": error_msg, "safety_denied": True})
-                else:
-                    # Token authorization check (T3)
-                    if tc.name in {"integration.status", "integration.action", "integration.setup"}:
-                        auth = None
-                    else:
-                        auth = self._token_checker.check_authorization(
-                            tc.name, tc.args, session_id
-                        )
-                    if auth is not None and not auth.authorized:
-                        if auth.requires_user_confirmation:
-                            error_msg = f"[AUTH] Tool '{tc.name}' requires explicit user approval: {auth.reason}"
-                        else:
-                            error_msg = f"[AUTH] Tool '{tc.name}' denied: {auth.reason}"
-                        logger.warning(error_msg)
-                        result = json.dumps({"error": error_msg, "auth_denied": True})
-                    else:
-                        result = await self._dispatch_with_progress(tc)
-                    # Audit log: record every tool call
-                    if self._audit_log:
+                # Progress: turn_start (1-indexed for human display)
+                await self._progress.turn_start(
+                    turn=planning_turns + 1,
+                    max_turns=int(getattr(self._cfg, "max_planning_turns", 10)),
+                )
+
+                # Budget pre-flight using actual input token count
+                try:
+                    input_tokens = self._ctx.count_tokens("\n".join(
+                        m.get("content", "") for m in messages if isinstance(m.get("content"), str)
+                    ))
+                    await self._budget.check_and_deduct(
+                        model,
+                        input_tokens,
+                        input_tokens // 3,
+                        allow_over_budget=_budget_bypass_requested(message),
+                    )
+                    call_cost = self._budget._last_call_cost
+                except BudgetExceeded as exc:
+                    raise BudgetExceeded(
+                        (
+                            f"{exc} This is a warning gate, not a permanent stop. "
+                            "Reply with 'continue anyway' or 'bypass budget' to run this turn "
+                            "and record the spend as a budget override."
+                        ),
+                        cap_type=exc.cap_type,
+                        cap_value=exc.cap_value,
+                        current=exc.current,
+                        call_cost=exc.call_cost,
+                    ) from exc
+                except Exception:
+                    call_cost = 0.0
+                total_cost += call_cost
+
+                force = planning_turns >= self._cfg.max_planning_turns
+
+                # Route every turn through SwarmSync when enabled — no direct
+                # OpenRouter calls.  Falls back to _stream_collect only when
+                # SwarmSync is disabled or returns empty.
+                text = ""
+                tool_calls: list[ToolCall] = []
+                used_swarmsync = False
+
+                # Progress: llm_start (emitted around the actual LLM call,
+                # whether routed via SwarmSync or the local stream_collect
+                # fallback).  llm_end fires in a finally so it always pairs.
+                await self._progress.llm_start(model=model, token_budget=input_tokens if isinstance(input_tokens, int) else 0)
+                try:
+                    if use_swarmsync and not force:
                         try:
-                            cost_cents = 0
-                            # Try to determine cost from budget
-                            try:
-                                cost_cents = int(round(self._budget._last_call_cost * 100))
-                            except Exception:
-                                pass
-                            self._audit_log.log(
-                                session_id, "tool_call", tc.name,
-                                tc.args,
-                                result,
-                                cost_cents=cost_cents,
+                            # Sanitize tool names in message history so they match the
+                            # sanitized tool definitions we send to SwarmSync.  Without
+                            # this, the API rejects tool results referencing tool names
+                            # that don't appear in the tool definitions.
+                            swarm_messages = _sanitize_messages_for_api(messages)
+                            if planning_turns > 0:
+                                _msg_summary = []
+                                for _m in swarm_messages:
+                                    _r = _m.get("role", "?")
+                                    if _r == "assistant" and _m.get("tool_calls"):
+                                        _tc_info = [tc.get("function", {}).get("name", "?") for tc in _m["tool_calls"]]
+                                        _msg_summary.append(f"assistant(tc={_tc_info})")
+                                    elif _r == "tool":
+                                        _msg_summary.append(f"tool(id={_m.get('tool_call_id', '?')[:15]})")
+                                    else:
+                                        _msg_summary.append(_r)
+                                logger.info("SwarmSync msg structure: %s", _msg_summary)
+                            # BUG FIX BH-002b: Per-turn SwarmSync timeout (45s) so one
+                            # slow API call doesn't eat the entire 180s gateway budget.
+                            if hasattr(self._router, "_swarmsync_complete_message"):
+                                routed_model, swarm_response = await asyncio.wait_for(
+                                    self._router._swarmsync_complete_message(
+                                        swarm_messages, swarm_key, complexity, tools=_tools_for_swarm,
+                                    ),
+                                    timeout=50,
+                                )
+                            else:
+                                routed_model, swarm_response = await asyncio.wait_for(
+                                    self._router._swarmsync_complete(
+                                        swarm_messages, swarm_key, complexity,
+                                    ),
+                                    timeout=50,
+                                )
+                            if not isinstance(swarm_response, dict):
+                                swarm_response = {"role": "assistant", "content": swarm_response or ""}
+                            model = routed_model
+                            logger.info(
+                                "SwarmSync turn=%d keys=%s has_tool_calls=%s content_len=%d model=%s",
+                                planning_turns,
+                                list(swarm_response.keys()),
+                                "tool_calls" in swarm_response,
+                                len(swarm_response.get("content", "") or ""),
+                                model,
                             )
-                        except Exception as audit_exc:
-                            logger.debug("Audit log failed: %s", audit_exc)
+                            text = swarm_response.get("content", "") or ""
+                            tool_calls = _parse_tool_calls_openai(swarm_response)
+                            tool_calls.extend(_parse_tool_calls_text(text))
+                            text = _strip_tool_call_blocks(text)
+                            # Reverse-map sanitized tool names back to dotted originals
+                            for tc in tool_calls:
+                                if tc.name in _swarm_name_map:
+                                    tc.name = _swarm_name_map[tc.name]
+                            logger.info(
+                                "SwarmSync parsed: text_len=%d tool_calls=%d names=%s text_repr=%r",
+                                len(text), len(tool_calls),
+                                [tc.name for tc in tool_calls] if tool_calls else "[]",
+                                _scrub_secrets(text[:200]) if text else "",
+                            )
+                            if text or tool_calls:
+                                used_swarmsync = True
+                        except Exception as exc:
+                            logger.warning("SwarmSync turn %d failed: %s — falling back to _stream_collect", planning_turns, exc)
 
+                    if not used_swarmsync:
+                        logger.info("Using _stream_collect (turn=%d, swarmsync=%s)", planning_turns, use_swarmsync)
+                        text, tool_calls = await self._stream_collect(messages, model, force)
+                finally:
+                    # Surface a single llm_token chunk with the assistant text
+                    # so the frontend can render the model's "thinking" even
+                    # when streaming is not supported by SwarmSync.  Capped to
+                    # avoid flooding the WS channel.
+                    try:
+                        if text:
+                            preview = text if len(text) <= 800 else text[:800] + "…"
+                            await self._progress.llm_token(preview)
+                    except Exception:
+                        pass
+                    try:
+                        await self._progress.llm_end(tokens_used=int(len(text) // _CHARS_PER_TOKEN) if text else 0)
+                    except Exception:
+                        pass
+
+                _ensure_tool_call_ids(tool_calls, planning_turns)
                 await _aappend(tpath, {
-                    "ts": _now(), "role": "tool",
-                    "tool_name": tc.name, "tool_call_id": tc.call_id,
-                    "result": result, "session_id": session_id,
+                    "ts": _now(), "role": "assistant", "content": text,
+                    "tool_calls": [_tool_call_to_openai(tc) for tc in tool_calls],
+                    "cost_usd": call_cost, "model": model, "session_id": session_id,
                 })
-                messages.append(_tool_result_message(tc, result))
+                messages.append(_assistant_message_with_tool_calls(text, tool_calls))
+
+                if not tool_calls or force:
+                    # Detect "phantom action" — model described doing something but
+                    # never emitted a tool_call.  Re-prompt once so it actually
+                    # executes instead of just narrating.
+                    _ACTION_HINTS = (
+                        "i'll ", "i will ", "let me ", "i'm going to ",
+                        "i am going to ", "let's ", "i can ",
+                        "i'll now ", "let me now ",
+                    )
+                    _text_lower = (text or "").lower()
+                    if (
+                        not force
+                        and planning_turns == 0
+                        and any(h in _text_lower for h in _ACTION_HINTS)
+                        and not getattr(self, "_continuation_retried", False)
+                    ):
+                        logger.warning(
+                            "Phantom action detected — model described actions without "
+                            "tool_calls. Re-prompting with continuation."
+                        )
+                        self._continuation_retried = True
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You described what you would do but did not actually "
+                                "call any tools. Please use the available tools to "
+                                "execute the actions now — do not just describe them."
+                            ),
+                        })
+                        await self._progress.turn_end(turn=planning_turns + 1, has_final_answer=False)
+                        planning_turns += 1
+                        continue
+                    final_text = text
+                    await self._progress.turn_end(turn=planning_turns + 1, has_final_answer=True)
+                    break
+
+                planning_turns += 1
+                for tc in tool_calls:
+                    # Resolve hallucinated/short tool names before dispatch
+                    tc.name = _resolve_tool_name(tc.name)
+                    if tc.error or not tc.name or not isinstance(tc.args, dict) or tc.name not in _TOOL_REGISTRY:
+                        result = await self._dispatch_with_progress(tc)
+                    # Safety gate: check before every tool call
+                    elif self._safety and not self._safety.check_and_confirm(tc.name, tc.args):
+                        error_msg = f"[SAFETY] Action '{tc.name}' denied by safety guard."
+                        logger.warning(error_msg)
+                        if self._audit_log:
+                            self._audit_log.log(
+                                session_id, "error", tc.name, tc.args, {},
+                                error=error_msg,
+                            )
+                        result = json.dumps({"error": error_msg, "safety_denied": True})
+                    else:
+                        # Token authorization check (T3)
+                        if tc.name in {"integration.status", "integration.action", "integration.setup"}:
+                            auth = None
+                        else:
+                            auth = self._token_checker.check_authorization(
+                                tc.name, tc.args, session_id
+                            )
+                        if auth is not None and not auth.authorized:
+                            if auth.requires_user_confirmation:
+                                error_msg = f"[AUTH] Tool '{tc.name}' requires explicit user approval: {auth.reason}"
+                            else:
+                                error_msg = f"[AUTH] Tool '{tc.name}' denied: {auth.reason}"
+                            logger.warning(error_msg)
+                            result = json.dumps({"error": error_msg, "auth_denied": True})
+                        else:
+                            result = await self._dispatch_with_progress(tc)
+                        # Audit log: record every tool call
+                        if self._audit_log:
+                            try:
+                                cost_cents = 0
+                                # Try to determine cost from budget
+                                try:
+                                    cost_cents = int(round(self._budget._last_call_cost * 100))
+                                except Exception:
+                                    pass
+                                self._audit_log.log(
+                                    session_id, "tool_call", tc.name,
+                                    tc.args,
+                                    result,
+                                    cost_cents=cost_cents,
+                                )
+                            except Exception as audit_exc:
+                                logger.debug("Audit log failed: %s", audit_exc)
+
+                    await _aappend(tpath, {
+                        "ts": _now(), "role": "tool",
+                        "tool_name": tc.name, "tool_call_id": tc.call_id,
+                        "result": result, "session_id": session_id,
+                    })
+                    messages.append(_tool_result_message(tc, result))
+
+                # All tools done; close the turn before looping again.
+                await self._progress.turn_end(turn=planning_turns, has_final_answer=False)
+        finally:
+            # Always fire session_end so the frontend ghost message is torn
+            # down even when the loop bails via exception or timeout.
+            try:
+                await self._progress.session_end(total_turns=planning_turns)
+            except Exception:
+                pass
 
         # BUG FIX BH-001: Never return empty final_text — gateway.send()
         # strips the budget footer, leaving nothing, which triggers the
@@ -1899,6 +1959,9 @@ class AgentLoop:
         BH-011 — Wraps the bare `_dispatch_tool` so the gateway can surface
         the currently-running tool in the desktop activity pill.  Callback
         failures are swallowed; tool dispatch itself is the source of truth.
+
+        Also emits the richer Claude-Code-style tool_start / tool_end
+        progress events when a ProgressEmitter is attached.
         """
         cb = self._on_tool_progress
         summary = _summarize_tool_call(tc)
@@ -1909,8 +1972,35 @@ class AgentLoop:
                     await _res
             except Exception as exc:
                 logger.debug("BH-011 progress callback (start) failed: %s", exc)
+        # Streaming feed: emit structured tool_start
         try:
-            return await _dispatch_tool(tc)
+            emitter = getattr(self, "_progress", None)
+            if emitter is not None:
+                await emitter.tool_start(
+                    tool=tc.name or "",
+                    args_preview=summary,
+                    call_id=tc.call_id or "",
+                )
+        except Exception:
+            pass
+
+        _ok = True
+        _result_text = ""
+        try:
+            _result_text = await _dispatch_tool(tc)
+            # Heuristic success detection — _dispatch_tool returns a JSON
+            # blob; if it contains an "error" key we mark the call failed.
+            try:
+                _parsed = json.loads(_result_text) if _result_text else None
+                if isinstance(_parsed, dict) and ("error" in _parsed):
+                    _ok = False
+            except Exception:
+                # Non-JSON result is treated as success by default.
+                pass
+            return _result_text
+        except Exception:
+            _ok = False
+            raise
         finally:
             if cb is not None:
                 try:
@@ -1919,6 +2009,19 @@ class AgentLoop:
                         await _res
                 except Exception as exc:
                     logger.debug("BH-011 progress callback (end) failed: %s", exc)
+            # Streaming feed: emit structured tool_end (success bit + summary)
+            try:
+                emitter = getattr(self, "_progress", None)
+                if emitter is not None:
+                    _result_summary = (_result_text or "").replace("\n", " ")[:160]
+                    await emitter.tool_end(
+                        tool=tc.name or "",
+                        call_id=tc.call_id or "",
+                        success=_ok,
+                        summary=_result_summary,
+                    )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Streaming
