@@ -151,3 +151,8 @@ workspace_files/
 
 # Audit reports (judgment-call group)
 final-outcome-audit-reports/
+
+# Google OAuth client-secret JSON files (downloaded from GCP Credentials page).
+# These contain client_id + client_secret and must never land in git.
+client_secret*.json
+client_secret*.txt
