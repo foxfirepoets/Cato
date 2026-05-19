@@ -224,6 +224,57 @@ async def test_routing_status_accepts_legacy_swarmsync_key_without_live_test():
         assert data["swarm_key_needs_normalization"] is True
 
 
+@pytest.mark.asyncio
+async def test_usage_routing_returns_evidence_contract(monkeypatch):
+    """Routing history API exposes the full SwarmSync evidence trail."""
+    app = await create_ui_app(gateway=None)
+
+    monkeypatch.setattr(
+        "cato.router.get_routing_history",
+        lambda: [
+            {
+                "ts": 1770000000.0,
+                "timestamp": "2026-05-19T12:00:00+00:00",
+                "request_id": "req-api-1",
+                "provider": "swarmsync",
+                "status": "ok",
+                "success": True,
+                "routed_model": "openrouter/minimax/minimax-m2.5",
+                "raw_model": "minimax/minimax-m2.5",
+                "routing_reason": "balanced quality and cost",
+                "tier": "economy",
+                "considered_models": ["minimax/minimax-m2.5", "gemini/flash"],
+                "fallback_routing": False,
+                "estimated_cost": 0.002,
+                "actual_cost": 0.0015,
+                "complexity_score": 0.2,
+                "history_length": 2,
+                "has_tools": False,
+                "http_status": 200,
+                "content_chars": 12,
+                "tool_call_count": 0,
+                "error": "",
+            }
+        ],
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/usage/routing?limit=1", headers=_auth_headers())
+        assert resp.status == 200
+        data = await resp.json()
+        event = data["events"][0]
+        assert data["log_path"]
+        assert "request_id" in data["fields"]
+        assert event["request_id"] == "req-api-1"
+        assert event["routing_reason"] == "balanced quality and cost"
+        assert event["considered_models"] == ["minimax/minimax-m2.5", "gemini/flash"]
+        assert event["fallback_routing"] is False
+        assert event["estimated_cost"] == 0.002
+        assert event["actual_cost"] == 0.0015
+        assert event["success"] is True
+        assert event["timestamp"] == "2026-05-19T12:00:00+00:00"
+
+
 # ------------------------------------------------------------------ #
 # Config endpoint                                                     #
 # ------------------------------------------------------------------ #

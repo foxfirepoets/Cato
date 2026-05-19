@@ -2,13 +2,17 @@
 cato/adapters/telegram.py — Telegram channel adapter (python-telegram-bot v20+).
 
 Listens for text messages and photos via long-polling.
-Provides six slash commands for runtime control:
-  /start   — greeting and quick-start instructions
-  /help    — describe what Cato can do
-  /budget  — show current spend vs. caps
+Provides slash commands for runtime control and personal assistant features:
+  /start    — greeting and quick-start instructions
+  /help     — describe what Cato can do
+  /budget   — show current spend vs. caps
   /sessions — list active session IDs
-  /kill    — terminate a specific session
-  /status  — daemon uptime and adapter health
+  /kill     — terminate a specific session
+  /status   — daemon uptime and adapter health
+  /check    — trigger immediate Gmail check
+  /today    — generate a day summary from open todos/reminders
+  /notes    — show recent 10 notes
+  /todos    — show open todos
 
 All credentials are fetched from the Vault — no hardcoded tokens.
 """
@@ -17,11 +21,13 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING
+import re
+from typing import TYPE_CHECKING, Optional
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -32,8 +38,10 @@ from telegram.helpers import escape_markdown
 from .base import BaseAdapter
 
 if TYPE_CHECKING:
+    from ..adapters.gmail_adapter import GmailAdapter
     from ..config import CatoConfig
     from ..gateway import Gateway
+    from ..router import ModelRouter
     from ..vault import Vault
 
 logger = logging.getLogger(__name__)
@@ -60,6 +68,10 @@ class TelegramAdapter(BaseAdapter):
         super().__init__(gateway, vault, config)
         self.app: Application | None = None
         self._bot_token: str | None = None
+
+        # Wired externally after construction (Ben Assistant features)
+        self._gmail_adapter: Optional["GmailAdapter"] = None
+        self._router: Optional["ModelRouter"] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -93,6 +105,15 @@ class TelegramAdapter(BaseAdapter):
         self.app.add_handler(CommandHandler("sessions", self._cmd_sessions))
         self.app.add_handler(CommandHandler("kill",     self._cmd_kill))
         self.app.add_handler(CommandHandler("status",   self._cmd_status))
+        self.app.add_handler(CommandHandler("check",    self._cmd_check))
+        self.app.add_handler(CommandHandler("today",    self._cmd_today))
+        self.app.add_handler(CommandHandler("notes",    self._cmd_notes))
+        self.app.add_handler(CommandHandler("todos",    self._cmd_todos))
+
+        # Approve/dismiss callback buttons from email notifications
+        self.app.add_handler(
+            CallbackQueryHandler(self._cb_email_action, pattern=r"^(approve|dismiss)_\d+$")
+        )
 
         # Register bot command menu (shown in Telegram UI)
         await self.app.bot.set_my_commands([
@@ -102,6 +123,10 @@ class TelegramAdapter(BaseAdapter):
             BotCommand("sessions", "List active sessions"),
             BotCommand("kill",     "Kill a session: /kill <session_id>"),
             BotCommand("status",   "Show daemon status"),
+            BotCommand("check",    "Trigger immediate Gmail check"),
+            BotCommand("today",    "Get a day summary from todos/reminders"),
+            BotCommand("notes",    "Show recent 10 notes"),
+            BotCommand("todos",    "Show open todos"),
         ])
 
         self.running = True
@@ -161,7 +186,11 @@ class TelegramAdapter(BaseAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Route an incoming plain-text message into the Gateway."""
+        """Route an incoming plain-text message into the Gateway.
+
+        Also classifies free-text messages as personal notes (todo/memory/
+        idea/reminder) and saves them to personal_store via haiku.
+        """
         if update.effective_user is None or update.message is None:
             return
         user_id    = str(update.effective_user.id)
@@ -178,6 +207,10 @@ class TelegramAdapter(BaseAdapter):
             pass
 
         await self.gateway.ingest(session_id, text, "telegram")
+
+        # Classify and persist as a personal note (best-effort; never raises)
+        if text.strip() and not text.startswith("/"):
+            await self._capture_note(text, update)
 
     async def _handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle an incoming photo by passing the file URL as a synthetic message.
@@ -279,3 +312,197 @@ class TelegramAdapter(BaseAdapter):
             f"Adapters: {', '.join(adapters) or 'none'}",
             parse_mode="Markdown",
         )
+
+    # ------------------------------------------------------------------
+    # Ben Assistant commands
+    # ------------------------------------------------------------------
+
+    async def _cmd_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Trigger an immediate Gmail check."""
+        if self._gmail_adapter is None:
+            await update.message.reply_text("Gmail adapter not configured.")
+            return
+        await update.message.reply_text("Checking Gmail now...")
+        try:
+            # Wire Telegram app + chat_id for this session so notifications arrive
+            self._gmail_adapter._telegram_app = self.app
+            self._gmail_adapter._telegram_chat_id = str(update.effective_chat.id)
+            await self._gmail_adapter.check_once()
+            await update.message.reply_text("Email check complete.")
+        except Exception as exc:
+            logger.error("/check failed: %s", exc)
+            await update.message.reply_text(f"Email check failed: {exc}")
+
+    async def _cmd_today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Generate a plain-English day summary from open todos/reminders."""
+        from cato.core import personal_store  # noqa: PLC0415
+
+        items = personal_store.get_todos_and_reminders()
+        if not items:
+            await update.message.reply_text("Nothing on the list today.")
+            return
+
+        if self._router is None:
+            lines = "\n".join(
+                f"- [{i['category']}] {i['content']}" for i in items
+            )
+            await update.message.reply_text(f"Open items:\n{lines}")
+            return
+
+        item_list = "\n".join(
+            f"- [{i['category']}] {i['content']}"
+            + (f" (due: {i['due_date']})" if i.get("due_date") else "")
+            for i in items
+        )
+        prompt = (
+            "Write a brief, plain-English daily briefing based on these open items. "
+            "Be direct and concise. No preamble.\n\n"
+            f"{item_list}"
+        )
+        try:
+            from cato.swarmsync import get_swarmsync_api_key  # noqa: PLC0415
+            api_key, _source = get_swarmsync_api_key(self._router._vault)
+            messages = [{"role": "user", "content": prompt}]
+            _model, msg = await self._router._swarmsync_complete_message(messages, api_key, 0.2)
+            summary = (msg.get("content") or "").strip() or "No summary generated."
+            await update.message.reply_text(summary)
+        except Exception as exc:
+            logger.error("/today LLM call failed: %s", exc)
+            await update.message.reply_text(f"Summary generation failed: {exc}")
+
+    async def _cmd_notes(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show the most recent 10 notes."""
+        from cato.core import personal_store  # noqa: PLC0415
+
+        notes = personal_store.get_recent_notes(10)
+        if not notes:
+            await update.message.reply_text("No notes yet.")
+            return
+        lines = []
+        for n in notes:
+            due = f" ({n['due_date']})" if n.get("due_date") else ""
+            lines.append(f"[{n['category']}] {n['content']}{due}")
+        await update.message.reply_text("\n".join(lines))
+
+    async def _cmd_todos(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show open todos."""
+        from cato.core import personal_store  # noqa: PLC0415
+
+        todos = personal_store.get_todos_and_reminders()
+        open_todos = [t for t in todos if t.get("category") == "todo"]
+        if not open_todos:
+            await update.message.reply_text("No open todos.")
+            return
+        lines = []
+        for i, t in enumerate(open_todos, 1):
+            due = f" (due: {t['due_date']})" if t.get("due_date") else ""
+            lines.append(f"{i}. {t['content']}{due}")
+        await update.message.reply_text("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Email approve/dismiss callback
+    # ------------------------------------------------------------------
+
+    async def _cb_email_action(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle approve_<id> and dismiss_<id> callback button taps."""
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()  # stop the loading spinner on the button
+
+        data = query.data or ""
+        match = re.match(r"^(approve|dismiss)_(\d+)$", data)
+        if not match:
+            await query.edit_message_text("Unknown action.")
+            return
+
+        action, row_id_str = match.group(1), match.group(2)
+        row_id = int(row_id_str)
+
+        from cato.core import personal_store  # noqa: PLC0415
+
+        if action == "dismiss":
+            personal_store.update_email_status(row_id, "dismissed")
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.answer("Dismissed.", show_alert=False)
+            return
+
+        # approve
+        claimed = personal_store.claim_email_for_send(row_id)
+        if claimed is None:
+            await query.answer("Already processed.", show_alert=True)
+            return
+
+        email_row = personal_store.get_email_by_id(row_id)
+        if email_row is None:
+            await query.answer("Email record not found.", show_alert=True)
+            return
+
+        gmail_draft_id = email_row.get("gmail_draft_id")
+        if not gmail_draft_id:
+            personal_store.update_email_status(row_id, "dismissed")
+            await query.answer("No draft ID — could not send.", show_alert=True)
+            return
+
+        if self._gmail_adapter is None:
+            personal_store.update_email_status(row_id, "dismissed")
+            await query.answer("Gmail adapter not available.", show_alert=True)
+            return
+
+        try:
+            await self._gmail_adapter.send_draft(gmail_draft_id)
+            personal_store.update_email_status(row_id, "sent")
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.answer("Sent!", show_alert=False)
+        except Exception as exc:
+            logger.error("send_draft failed for row %d: %s", row_id, exc)
+            await query.answer(f"Send failed: {exc}"[:200], show_alert=True)
+
+    # ------------------------------------------------------------------
+    # Note capture helper
+    # ------------------------------------------------------------------
+
+    async def _capture_note(self, text: str, update: Update) -> None:
+        """Classify *text* as a personal note and persist it (best-effort)."""
+        from cato.core import personal_store  # noqa: PLC0415
+
+        category = "memory"
+        due_date = None
+
+        if self._router is not None:
+            prompt = (
+                "Classify this note as exactly one of: todo, memory, idea, reminder.\n"
+                "Also extract a due_date if mentioned (ISO YYYY-MM-DD format) or null.\n"
+                "Return JSON only, no explanation: "
+                '{"category": "...", "due_date": "...or null"}\n\n'
+                f"<note>\n{text}\n</note>"
+            )
+            try:
+                from cato.swarmsync import get_swarmsync_api_key  # noqa: PLC0415
+                api_key, _source = get_swarmsync_api_key(self._router._vault)
+                messages = [{"role": "user", "content": prompt}]
+                _model, msg = await self._router._swarmsync_complete_message(
+                    messages, api_key, 0.1
+                )
+                raw = (msg.get("content") or "").strip()
+                # Tolerate ```json fences
+                json_match = re.search(r"\{[\s\S]*?\}", raw)
+                if json_match:
+                    import json  # noqa: PLC0415
+                    parsed = json.loads(json_match.group(0))
+                    raw_cat = (parsed.get("category") or "memory").lower()
+                    valid = {"todo", "memory", "idea", "reminder"}
+                    category = raw_cat if raw_cat in valid else "memory"
+                    raw_due = parsed.get("due_date")
+                    if raw_due and re.match(r"^\d{4}-\d{2}-\d{2}", str(raw_due)):
+                        due_date = str(raw_due)[:10]
+            except Exception as exc:
+                logger.debug("Note classification failed (%s), defaulting to memory", exc)
+
+        try:
+            personal_store.save_note(text, category, due_date)
+            logger.debug("Note saved: [%s] %s", category, text[:50])
+        except Exception as exc:
+            logger.warning("Failed to save note: %s", exc)

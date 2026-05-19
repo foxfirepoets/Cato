@@ -48,6 +48,20 @@ from .vault import Vault
 
 logger = logging.getLogger(__name__)
 
+_BUDGET_BYPASS_PHRASES = (
+    "continue anyway",
+    "bypass budget",
+    "override budget",
+    "ignore budget",
+    "proceed anyway",
+    "keep going",
+)
+
+
+def _budget_bypass_requested(message: str) -> bool:
+    text = message.lower()
+    return any(phrase in text for phrase in _BUDGET_BYPASS_PHRASES)
+
 _CATO_DIR       = get_data_dir()
 _CHARS_PER_TOKEN = 4
 _MAX_RETRIES    = 3
@@ -1505,10 +1519,25 @@ class AgentLoop:
                 input_tokens = self._ctx.count_tokens("\n".join(
                     m.get("content", "") for m in messages if isinstance(m.get("content"), str)
                 ))
-                await self._budget.check_and_deduct(model, input_tokens, input_tokens // 3)
+                await self._budget.check_and_deduct(
+                    model,
+                    input_tokens,
+                    input_tokens // 3,
+                    allow_over_budget=_budget_bypass_requested(message),
+                )
                 call_cost = self._budget._last_call_cost
-            except BudgetExceeded:
-                raise
+            except BudgetExceeded as exc:
+                raise BudgetExceeded(
+                    (
+                        f"{exc} This is a warning gate, not a permanent stop. "
+                        "Reply with 'continue anyway' or 'bypass budget' to run this turn "
+                        "and record the spend as a budget override."
+                    ),
+                    cap_type=exc.cap_type,
+                    cap_value=exc.cap_value,
+                    current=exc.current,
+                    call_cost=exc.call_cost,
+                ) from exc
             except Exception:
                 call_cost = 0.0
             total_cost += call_cost

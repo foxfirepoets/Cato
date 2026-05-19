@@ -892,7 +892,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         """GET /api/budget/summary — current spend, caps, pct remaining."""
         try:
             if gateway is None:
-                return web.json_response({"session_spend": 0, "session_cap": 1.0,
+                return web.json_response({"session_spend": 0, "session_cap": 3.0,
                                           "monthly_spend": 0, "monthly_cap": 20.0,
                                           "session_pct_remaining": 100, "monthly_pct_remaining": 100,
                                           "monthly_calls": 0, "total_spend_all_time": 0})
@@ -962,11 +962,54 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         try:
             from cato.router import get_routing_history as _get_history
             from cato.routing_log import get_routing_log_path
-            history = _get_history()
-            limit = int(request.rel_url.query.get("limit", "100"))
+            raw_limit = request.rel_url.query.get("limit", "100")
+            try:
+                limit = max(1, min(int(raw_limit), 1000))
+            except (TypeError, ValueError):
+                limit = 100
+
+            def _event(row: dict) -> dict:
+                return {
+                    "ts": row.get("ts", 0),
+                    "timestamp": row.get("timestamp", ""),
+                    "request_id": row.get("request_id", ""),
+                    "provider": row.get("provider", "swarmsync"),
+                    "status": row.get("status", "unknown"),
+                    "success": bool(row.get("success")),
+                    "routed_model": row.get("routed_model") or row.get("chosen_model") or "",
+                    "chosen_model": row.get("chosen_model") or row.get("routed_model") or "",
+                    "raw_model": row.get("raw_model", ""),
+                    "routing_reason": row.get("routing_reason", ""),
+                    "tier": row.get("tier", ""),
+                    "considered_models": row.get("considered_models") or [],
+                    "fallback_routing": bool(row.get("fallback_routing")),
+                    "estimated_cost": row.get("estimated_cost"),
+                    "actual_cost": row.get("actual_cost"),
+                    "complexity": row.get("complexity", row.get("complexity_score", 0.0)),
+                    "complexity_score": row.get("complexity_score", row.get("complexity", 0.0)),
+                    "has_tools": bool(row.get("has_tools")),
+                    "msg_count": row.get("msg_count", row.get("history_length", 0)),
+                    "history_length": row.get("history_length", row.get("msg_count", 0)),
+                    "http_status": row.get("http_status"),
+                    "content_chars": row.get("content_chars", 0),
+                    "tool_call_count": row.get("tool_call_count", 0),
+                    "error": row.get("error", ""),
+                }
+
+            history = [_event(row) for row in _get_history()]
             return web.json_response({
                 "log_path": str(get_routing_log_path()),
                 "events": history[-limit:],
+                "fields": [
+                    "request_id",
+                    "routing_reason",
+                    "considered_models",
+                    "fallback_routing",
+                    "estimated_cost",
+                    "actual_cost",
+                    "success",
+                    "timestamp",
+                ],
             })
         except Exception as exc:
             logger.error("get_routing_history error: %s", exc)

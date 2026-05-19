@@ -167,13 +167,13 @@ def cmd_init() -> None:
     # 2. Session cap
     raw_session = click.prompt(
         "Session budget cap (USD)",
-        default="1.00",
+        default="3.00",
         show_default=True,
     )
     try:
         session_cap = float(raw_session.replace("$", "").strip())
     except ValueError:
-        session_cap = 1.00
+        session_cap = 3.00
     config.session_cap = session_cap
 
     # 3. Vault master password
@@ -513,6 +513,7 @@ def _run_daemon(config: CatoConfig, agent: str, channel: str) -> None:
 
         gateway = Gateway(cfg, bdg, vlt)
 
+        tg: "TelegramAdapter | None" = None
         if cfg.telegram_enabled:
             try:
                 tg = TelegramAdapter(gateway, vlt, cfg)
@@ -520,6 +521,25 @@ def _run_daemon(config: CatoConfig, agent: str, channel: str) -> None:
                 log.info("Telegram adapter registered")
             except Exception as e:
                 log.warning(f"Telegram adapter failed to register: {e}")
+
+        # Wire Gmail adapter alongside Telegram (best-effort — no vault key = skipped)
+        if tg is not None and vlt is not None:
+            try:
+                from .adapters.gmail_adapter import GmailAdapter  # noqa: PLC0415
+                from .router import ModelRouter  # noqa: PLC0415
+
+                gmail = GmailAdapter(vault=vlt)
+                router = ModelRouter(vault=vlt, preferred_model="claude-sonnet-4-6")
+                tg._gmail_adapter = gmail
+                tg._router = router
+                # GmailAdapter needs app/chat_id at runtime; we set the app now
+                # and the chat_id is wired per-request in _cmd_check.
+                # For the scheduled poller we use None until first /check sets it.
+                gmail._router = router
+                asyncio.create_task(gmail.start())
+                log.info("GmailAdapter started")
+            except Exception as e:
+                log.warning(f"GmailAdapter failed to start: {e}")
 
         if cfg.whatsapp_enabled:
             try:

@@ -73,6 +73,25 @@ function formatModel(model: string): string {
   return model;
 }
 
+function formatCost(value: number | string | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "-";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  if (n === 0) return "$0.0000";
+  return n < 0.0001 ? `$${n.toExponential(2)}` : `$${n.toFixed(4)}`;
+}
+
+function isRoutingSuccess(entry: RoutingEntry): boolean {
+  if (typeof entry.success === "boolean") return entry.success;
+  return entry.status === "ok";
+}
+
+function formatRouteTime(entry: RoutingEntry): string {
+  if (entry.timestamp) return new Date(entry.timestamp).toLocaleString();
+  if (entry.ts) return new Date(entry.ts * 1000).toLocaleString();
+  return "-";
+}
+
 /* ── Daemon Logs Tab ── */
 const DaemonLogsTab: React.FC<{ base: string }> = ({ base }) => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -253,12 +272,17 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
               </tr>
             </thead>
             <tbody>
-              {[...entries].reverse().map((e, i) => (
+              {[...entries].reverse().map((e, i) => {
+                const success = isRoutingSuccess(e);
+                return (
                 <tr key={i} style={{ borderBottom: "1px solid var(--border-secondary, #1a1a2e)" }}>
                   <td style={{ padding: "6px 10px", fontFamily: "monospace", fontSize: 12, color: "var(--text-muted, #64748b)" }}>
-                    {e.timestamp ? new Date(e.timestamp).toLocaleString() : new Date(e.ts * 1000).toLocaleTimeString()}
+                    {formatRouteTime(e)}
                   </td>
-                  <td style={{ padding: "6px 10px", fontFamily: "monospace", fontSize: 11, color: "var(--text-muted, #64748b)" }}>
+                  <td
+                    title={e.request_id || ""}
+                    style={{ padding: "6px 10px", fontFamily: "monospace", fontSize: 11, color: "var(--text-muted, #64748b)" }}
+                  >
                     {(e.request_id || "-").slice(0, 12)}
                   </td>
                   <td style={{ padding: "6px 10px" }}>
@@ -284,17 +308,17 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
                     </div>
                   </td>
                   <td style={{ padding: "6px 10px", fontFamily: "monospace", fontSize: 12, color: "var(--text-muted, #64748b)" }}>
-                    est {e.estimated_cost ?? "-"}<br />
-                    act {e.actual_cost ?? "-"}
+                    est {formatCost(e.estimated_cost)}<br />
+                    act {formatCost(e.actual_cost)}
                   </td>
                   <td style={{ padding: "6px 10px", fontSize: 12 }}>
                     <span style={{
                       display: "inline-block", padding: "2px 7px", borderRadius: 6, fontWeight: 700,
-                      color: e.success ? "#86efac" : "#fca5a5",
-                      background: e.success ? "#14532d44" : "#7f1d1d44",
-                      border: `1px solid ${e.success ? "#15803d" : "#ef4444"}`,
+                      color: success ? "#86efac" : "#fca5a5",
+                      background: success ? "#14532d44" : "#7f1d1d44",
+                      border: `1px solid ${success ? "#15803d" : "#ef4444"}`,
                     }}>
-                      {e.success ? "OK" : "FAIL"}
+                      {success ? "OK" : "FAIL"}
                     </span>
                     {e.fallback_routing && <div style={{ marginTop: 4, color: "#fcd34d" }}>fallback</div>}
                     {e.error && <div style={{ marginTop: 4, color: "#fca5a5", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={e.error}>{e.error}</div>}
@@ -321,7 +345,8 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
                     {e.msg_count}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

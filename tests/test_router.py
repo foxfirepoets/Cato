@@ -36,6 +36,12 @@ def test_routing_decision_persists_to_sqlite_log(tmp_path, monkeypatch) -> None:
             "success": True,
             "chosen_model": "openrouter/minimax/minimax-m2.5",
             "raw_model": "minimax/minimax-m2.5",
+            "request_id": "req-router-1",
+            "routing_reason": "simple request routed to economy model",
+            "considered_models": ["minimax/minimax-m2.5", "gemini/flash"],
+            "estimated_cost": "0.0012",
+            "actual_cost": 0.001,
+            "fallback_routing": False,
             "complexity_score": 0.42,
             "history_length": 3,
             "has_tools": True,
@@ -51,3 +57,10 @@ def test_routing_decision_persists_to_sqlite_log(tmp_path, monkeypatch) -> None:
     assert history[0]["status"] == "ok"
     assert history[0]["routed_model"] == "openrouter/minimax/minimax-m2.5"
     assert history[0]["tool_call_count"] == 1
+    assert history[0]["request_id"] == "req-router-1"
+    assert history[0]["routing_reason"] == "simple request routed to economy model"
+    assert history[0]["considered_models"] == ["minimax/minimax-m2.5", "gemini/flash"]
+    assert history[0]["estimated_cost"] == 0.0012
+    assert history[0]["actual_cost"] == 0.001
+    assert history[0]["success"] is True
+    assert history[0]["fallback_routing"] is False

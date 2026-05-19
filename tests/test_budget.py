@@ -34,3 +34,27 @@ def test_unknown_model_uses_fallback(budget):
     # Unknown models should use conservative fallback pricing, not raise
     cost = budget.estimate_cost("unknown-model-xyz", 1_000_000, 0)
     assert cost == pytest.approx(3.00, rel=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_budget_override_warn_gate_records_spend(tmp_path):
+    manager = BudgetManager(session_cap=0.01, monthly_cap=0.02, budget_path=tmp_path / "budget.json")
+
+    with pytest.raises(BudgetExceeded) as exc:
+        await manager.check_and_deduct("claude-opus-4-6", 1_000_000, 500_000)
+    assert exc.value.cap_type == "session"
+    assert manager.get_status()["session_spend"] == 0
+
+    cost = await manager.check_and_deduct(
+        "claude-opus-4-6",
+        1_000_000,
+        500_000,
+        allow_over_budget=True,
+    )
+
+    status = manager.get_status()
+    assert cost > 0
+    assert status["session_spend"] == pytest.approx(cost)
+    assert status["monthly_spend"] == pytest.approx(cost)
+    assert manager._state["call_log"][-1]["budget_overridden"] is True
+    assert manager._state["call_log"][-1]["override_reasons"] == ["session", "monthly"]

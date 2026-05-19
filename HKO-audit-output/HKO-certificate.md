@@ -1,40 +1,31 @@
-# HKO-Truth-Audit Certificate: Cato — Post-Fix Verification
-**Date:** 2026-05-18
-**Code audited:** cato/router.py, cato/api/websocket_handler.py, cato/api/pty_routes.py,
-  desktop/src/views/SettingsView.tsx, desktop/src/components/TerminalPane.tsx,
-  desktop/src/hooks/useTalkPageStream.ts
+# HKO-Truth-Audit Certificate: Cato — Codex Routing+Budget Work
+**Date:** 2026-05-19
+**Code audited:** cato/routing_log.py, cato/router.py, cato/ui/server.py,
+  desktop/src/views/LogsView.tsx, tests/test_router.py,
+  cato/ui/tests/test_server_lifecycle.py, cato/budget.py, cato/config.py,
+  cato/cli.py, cato/agent_loop.py, tests/test_budget.py
 
 | Layer | Findings | Critical/High |
 |-------|----------|--------------|
-| HK (Code) | 1 new LOW (found + fixed inline) | 0 |
+| HK (Code) | 1 MEDIUM (fixed inline) + 4 LOW | 0 |
 | OTA (Contract) | 0 — DESIGN-TIME (no transcript) | 0 |
-| RIO (Integration) | 0 — all 7 tasks implemented | 0 |
-| MULTI (overlap/causal) | 0 | 0 |
+| RIO (Integration) | 0 — all 7 integration surfaces verified | 0 |
+| MULTI (overlap) | 0 | 0 |
 | CAUSAL LINKs | 0 | — |
 | HK Coverage | COMPLETE (inline) | — |
 | OTA Coverage | DESIGN-TIME — reduced confidence | — |
 
 **Overall result: PASS**
 
-All 5 findings from the prior FAIL audit (2026-05-18) are VERIFIED FIXED:
-- F-01 CRITICAL: SettingsView config corruption — FIXED
-- F-03 MEDIUM: Unredacted secrets in routing log SQLite — FIXED
-- F-04 MEDIUM: Shared circuit breaker counter — FIXED
-- F-05 LOW: WS token in URL query param — FIXED (+ auth regression fixed)
-- F-06 LOW: `_is_model_slug_only` false positive — FIXED
+No CRITICAL or HIGH findings. 1 MEDIUM finding (M-01) identified and fixed in this audit cycle.
 
-One new LOW finding (NEW-HK-1) was identified and fixed during this audit:
-- `websocket_handler.py:214` + `pty_routes.py:191`: `parsed.get("token", "")` returns `None`
-  for `{"token": null}` JSON, causing `TypeError` in `secrets.compare_digest`. Fixed with
-  `str(parsed.get("token") or "")`. Only exploitable when `daemon_token` is configured.
+**M-01 FIXED:** `config.vault` field excluded from YAML serialization in `save()`.
+Added `_RUNTIME_ONLY = frozenset({"vault"})` exclusion set in `cato/config.py`. Runtime-only
+credentials no longer risk being written to plaintext `~/.cato/config.yaml`.
 
-Test suite: **1803 passed, 4 skipped, 4 deselected** — no regressions.
+Test suite: **1804 passed, 4 skipped** — no regressions.
 
 **Residual risks (even after PASS):**
-1. No frontend integration tests cover the Settings save path. Any future change to
-   `SettingsView.tsx` or `patch_config` could re-introduce config corruption without detection.
-2. The `routing_log.sqlite3` database has no retention policy — it will grow unbounded on
-   long-running deployments.
-3. `_direct_cb_open_until` is set in `complete()` on threshold breach but the guard check
-   is not wired into the loop entry — the direct-LLM circuit breaker accumulates state but
-   does not actually short-circuit retries. This is pre-existing behaviour, not a regression.
+1. `routing_log.sqlite3` has no retention policy — will grow unbounded on long-running deployments.
+2. `_direct_cb_open_until` is set in `complete()` on threshold breach but the guard is not checked at loop entry — the direct-LLM circuit breaker accumulates state but does not actually short-circuit retries. Pre-existing behaviour.
+3. `ModelRoutingTab` silently swallows fetch errors — user sees an empty table with no error message when the routing history API fails.

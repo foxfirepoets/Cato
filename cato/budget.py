@@ -67,11 +67,19 @@ _BUDGET_FILE = get_data_dir() / "budget.json"
 class BudgetExceeded(Exception):
     """Raised when a spend request would exceed a configured cap."""
 
-    def __init__(self, message: str, cap_type: str, cap_value: float, current: float) -> None:
+    def __init__(
+        self,
+        message: str,
+        cap_type: str,
+        cap_value: float,
+        current: float,
+        call_cost: float = 0.0,
+    ) -> None:
         super().__init__(message)
         self.cap_type = cap_type
         self.cap_value = cap_value
         self.current = current
+        self.call_cost = call_cost
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +102,7 @@ class BudgetManager:
 
     def __init__(
         self,
-        session_cap: float = 1.00,
+        session_cap: float = 3.00,
         monthly_cap: float = 20.00,
         budget_path: Optional[Path] = None,
     ) -> None:
@@ -184,37 +192,47 @@ class BudgetManager:
         model: str,
         input_tokens: int,
         output_tokens: int,
+        *,
+        allow_over_budget: bool = False,
     ) -> float:
         """
         Validate spend against caps, deduct if within budget, persist state.
 
         Returns the cost of the call.
-        Raises BudgetExceeded if either session or monthly cap would be breached.
+        Raises BudgetExceeded if either session or monthly cap would be breached,
+        unless allow_over_budget=True.
         Thread-safe via asyncio.Lock.
         """
         async with self._lock:
             cost = self.estimate_cost(model, input_tokens, output_tokens)
+            override_reasons: list[str] = []
 
             # Session cap check
             if self._session_spend + cost > self._session_cap:
-                raise BudgetExceeded(
-                    f"Session cap ${self._session_cap:.2f} would be exceeded "
-                    f"(current ${self._session_spend:.4f}, call ${cost:.4f})",
-                    cap_type="session",
-                    cap_value=self._session_cap,
-                    current=self._session_spend,
-                )
+                if not allow_over_budget:
+                    raise BudgetExceeded(
+                        f"Session cap ${self._session_cap:.2f} would be exceeded "
+                        f"(current ${self._session_spend:.4f}, call ${cost:.4f})",
+                        cap_type="session",
+                        cap_value=self._session_cap,
+                        current=self._session_spend,
+                        call_cost=cost,
+                    )
+                override_reasons.append("session")
 
             # Monthly cap check
             monthly = self._state["monthly_spend"]
             if monthly + cost > self._monthly_cap:
-                raise BudgetExceeded(
-                    f"Monthly cap ${self._monthly_cap:.2f} would be exceeded "
-                    f"(current ${monthly:.4f}, call ${cost:.4f})",
-                    cap_type="monthly",
-                    cap_value=self._monthly_cap,
-                    current=monthly,
-                )
+                if not allow_over_budget:
+                    raise BudgetExceeded(
+                        f"Monthly cap ${self._monthly_cap:.2f} would be exceeded "
+                        f"(current ${monthly:.4f}, call ${cost:.4f})",
+                        cap_type="monthly",
+                        cap_value=self._monthly_cap,
+                        current=monthly,
+                        call_cost=cost,
+                    )
+                override_reasons.append("monthly")
 
             # Deduct
             self._session_spend += cost
@@ -232,6 +250,8 @@ class BudgetManager:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cost_usd": cost,
+                "budget_overridden": bool(override_reasons),
+                "override_reasons": override_reasons,
             }
             call_log = self._state.get("call_log", [])
             call_log.append(log_entry)

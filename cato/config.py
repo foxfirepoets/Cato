@@ -93,7 +93,7 @@ class CatoConfig:
     genesis_timeout_s: float = 30.0
 
     # Budget caps (USD)
-    session_cap: float = 1.00
+    session_cap: float = 3.00
     monthly_cap: float = 20.00
 
     # Workspace
@@ -214,15 +214,19 @@ class CatoConfig:
     # Persistence
     # ------------------------------------------------------------------
 
+    # Fields that must never be written to the plaintext YAML config file.
+    # vault is a runtime-only bridge credential store — it belongs in vault.enc, not config.yaml.
+    _RUNTIME_ONLY: frozenset[str] = frozenset({"vault"})
+
     def save(self, config_path: Optional[Path] = None) -> None:
         """Write current config to YAML file, creating parent dirs as needed."""
         path = config_path or self._path
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Serialise all public fields
+        # Serialise all public fields except runtime-only ones (e.g. vault)
         data: dict[str, Any] = {}
         for f in fields(self):
-            if not f.name.startswith("_"):
+            if not f.name.startswith("_") and f.name not in self._RUNTIME_ONLY:
                 data[f.name] = getattr(self, f.name)
 
         path.write_text(

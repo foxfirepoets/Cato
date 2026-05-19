@@ -1,211 +1,106 @@
-# HKO-Truth-Audit Report: Cato — Post-Fix Verification
-**Date:** 2026-05-18
-**Scope:** cato/router.py, cato/api/websocket_handler.py, cato/api/pty_routes.py,
-  desktop/src/views/SettingsView.tsx, desktop/src/components/TerminalPane.tsx,
-  desktop/src/hooks/useTalkPageStream.ts
-**Task docs:** HKO-audit-output/HKO-truth-audit-report.md (prior run), CATO_ALEX_AUDIT.md, CATO_KRAKEN_VERDICT.md
-**Severity threshold:** HIGH
-**OTA mode:** DESIGN-TIME (no transcript; supporting skill not file-backed)
-**HK mode:** COMPLETE (inline — supporting skill not file-backed)
-**RIO mode:** COMPLETE
-
----
-
-## Summary
-
-This audit verifies that all 5 findings from the prior HKO run (2026-05-18) were genuinely
-fixed by the O2O remediation pipeline, and checks for new issues introduced by the fixes.
-
-All 5 original findings are VERIFIED FIXED. One new LOW finding (token null-coercion, NEW-HK-1)
-was identified and fixed inline during this audit run. All 1803 tests pass.
+# HKO-Truth-Audit Report: Cato — Codex Routing+Budget Work
+**Date:** 2026-05-19
+**Scope:** cato/routing_log.py, cato/router.py, cato/ui/server.py,
+  desktop/src/views/LogsView.tsx, tests/test_router.py,
+  cato/ui/tests/test_server_lifecycle.py, cato/budget.py, cato/config.py,
+  cato/cli.py, cato/agent_loop.py, tests/test_budget.py
+**Mode:** HK (code) + OTA design-time + RIO (integration)
+**Severity threshold:** MEDIUM
 
 ---
 
 ## Findings
 
-### [FIXED] F-01 — CRITICAL (prior run) · SettingsView config corruption
-**Status: FIXED**
+### MEDIUM — SECURITY
 
-`desktop/src/views/SettingsView.tsx:83–91` — `case 'general':` branch is now present in
-`loadSettings()`. It fetches `/api/config` and calls `setDefaultModel(data.default_model || '')`
-and `setWorkspacePath(data.workspace_dir || '')`.
-
-`handleSaveConfig()` (lines 167–170) now uses conditional spreads:
-```typescript
-...(workspacePath ? { workspace_dir: workspacePath } : {}),
-...(defaultModel ? { default_model: defaultModel } : {}),
-```
-Empty strings are no longer sent to `PATCH /api/config`. Config corruption is eliminated.
-
-**Verification:** Code confirmed at `SettingsView.tsx:83–91, 167–170`.
+**M-01** `config.vault` serialized to plaintext YAML on `save()`
+- **Source:** HK
+- **Location:** `cato/config.py:222-231` (`save()` method)
+- **Description:** `CatoConfig.vault` is an `Optional[dict]` that can hold credentials (Conduit bridge login, WebSearchTool keys). `save()` iterates all non-private fields with no exclusion list, so `vault: {password: secret}` would be written to `~/.cato/config.yaml` in plaintext — outside the AES-256-GCM vault.enc.
+- **Fix:** Exclude `vault` from YAML serialization in `save()`. It is a runtime-only field, not a persisted config value.
+- **Status:** FIXED in this audit cycle.
 
 ---
 
-### [FIXED] F-03 — MEDIUM (prior run) · Unredacted secrets in routing_log SQLite
-**Status: FIXED**
+### LOW
 
-`cato/router.py:501–507` — success path now applies `_scrub_log_text()` to both
-`raw_model` and `routing_reason` before passing to `_record_routing_decision()`:
-```python
-"raw_model": _scrub_log_text(raw_model),
-"routing_reason": _scrub_log_text(swarmsync_meta.get("routing_reason") or ...),
-```
+**L-01** `_ensure_columns` uses f-string in ALTER TABLE
+- **Source:** HK
+- **Location:** `cato/routing_log.py:72`
+- **Description:** `f"ALTER TABLE routing_events ADD COLUMN {name} {ddl}"` — `name` and `ddl` come from a hardcoded module-level constant `_COLUMNS`. No injection risk in practice, but violates parameterized-query convention.
+- **Recommended fix:** Acceptable as-is given constant source; or add assertion `assert name.isidentifier()`.
 
-`cato/router.py:538` — HTTP error path applies `_scrub_log_text(body[:500])` to `error` field.
+**L-02** Routing log SQLite DB has no retention policy
+- **Source:** RIO
+- **Location:** `cato/routing_log.py`
+- **Description:** `routing_log.sqlite3` grows without bound. On a busy daemon this will fill disk over weeks.
+- **Recommended fix:** Add a `DELETE FROM routing_events WHERE id NOT IN (SELECT id FROM routing_events ORDER BY id DESC LIMIT 10000)` sweep in `record_routing_event` on every 1000th write.
 
-`cato/router.py:559` — exception path applies `_scrub_log_text(str(exc))` to `error` field.
+**L-03** `complete()` direct circuit breaker open-until not checked
+- **Source:** HK (pre-existing)
+- **Location:** `cato/router.py:667`
+- **Description:** `_direct_cb_open_until` is set when threshold is breached but the loop entry does not check it, so the circuit does not actually short-circuit direct LLM retries.
+- **Recommended fix:** Add guard at the top of the `for attempt_model in models_to_try:` loop (mirror the SwarmSync pattern).
 
-**Verification:** Code confirmed at `router.py:501,502,538,559`.
+**L-04** Dead `"swarmsync/"` prefix branch in `_get_api_key`
+- **Source:** HK
+- **Location:** `cato/router.py:947`
+- **Description:** `"swarmsync/": "SWARMSYNC_API_KEY"` — no model name starts with `"swarmsync/"` in normal routing. Dead code.
+- **Recommended fix:** Remove the entry or document its intent.
 
----
-
-### [FIXED] F-04 — MEDIUM (prior run) · Shared circuit breaker counter
-**Status: FIXED**
-
-`cato/router.py:294–300` — `ModelRouter.__init__` now initialises two independent counters:
-```python
-self._ss_cb_failures: int = 0       # SwarmSync API path
-self._ss_cb_open_until: float = 0.0
-self._direct_cb_failures: int = 0   # direct provider path
-self._direct_cb_open_until: float = 0.0
-```
-Old `self._cb_failures`/`self._cb_open_until` are gone. `_swarmsync_complete_message` uses
-`_ss_cb_*` exclusively; `complete()` uses `_direct_cb_*` exclusively. Three SwarmSync failures
-no longer block the direct-provider fallback chain.
-
-**Verification:** `grep -n "_cb_failures" cato/router.py` shows only `_ss_cb_failures` and
-`_direct_cb_failures`; `_cb_failures` absent. Spot-check assertion: `assert not hasattr(r, '_cb_failures')` passes.
+**L-05** `ModelRoutingTab` silently swallows fetch errors
+- **Source:** HK
+- **Location:** `desktop/src/views/LogsView.tsx:193`
+- **Description:** `catch { /* silent */ }` — routing history fetch errors show no user feedback; tab appears empty with no indication of failure.
+- **Recommended fix:** Set an `error` state in the catch branch and render a short error message.
 
 ---
 
-### [FIXED] F-05 — LOW (prior run) · WS token in URL query parameter
-**Status: FIXED**
-
-Frontend:
-- `TerminalPane.tsx:47` — `wsUrl` built without `?token=`; auth sent via `ws.onopen` at line 79.
-- `useTalkPageStream.ts:235` — URL built without `?token=`; auth sent via `ws.onopen` at line 242.
-
-Backend:
-- `cato/api/websocket_handler.py:204–220` — auth check gated on `if daemon_token:`. When no
-  daemon token is configured (tests, dev), the auth block is skipped entirely — no 5-second
-  blocking wait. Tokens accepted from `X-Cato-Token` header, `?token=` query param (legacy),
-  or first-message `{type:"auth",token}` envelope.
-- `cato/api/pty_routes.py:182–196` — identical gating.
-
-**Test regression fix:** The original Ben implementation blocked all unauthenticated WS connections
-for 5 seconds even in test environments (no daemon_token). Fixed by gating the entire auth flow
-on `if daemon_token:`. 4 previously-failing tests now pass.
-
-**Verification:** `tests/test_websocket_handler.py` and `tests/test_pty_routes_integration.py` —
-74 passed.
-
----
-
-### [FIXED] F-06 — LOW (prior run) · `_is_model_slug_only` false positive
-**Status: FIXED**
-
-`cato/router.py:187–206` — function now requires a known provider prefix:
-```python
-_KNOWN_MODEL_PROVIDERS = frozenset([
-    "openrouter", "anthropic", "openai", "google", "deepseek",
-    "groq", "mistral", "minimax", "moonshot", "meta-llama",
-])
-def _is_model_slug_only(text: str) -> bool:
-    ...
-    if "/" not in t: return False
-    provider = t.split("/")[0].lower()
-    return provider in _KNOWN_MODEL_PROVIDERS and re.match(r"^[\w\-./]+$", t) is not None
-```
-`"A/B"`, `"I/O"`, `"Yes/No"` all return `False` (provider not in set).
-
-**Verification:** Spot-check assertions all pass.
-
----
-
-### [NEW — FOUND AND FIXED] NEW-HK-1 — LOW · WS auth token null-coercion
-**Status: FIXED inline during this audit**
-
-`cato/api/websocket_handler.py:214` and `cato/api/pty_routes.py:191`:
-
-Original (introduced by F-05 fix):
-```python
-token = parsed.get("token", "")
-```
-When a client sends `{"type":"auth","token":null}`, `parsed.get("token", "")` returns `None`
-(the default is only used when the key is absent, not when it is `null`). Then:
-```python
-secrets.compare_digest(None, daemon_token)  # TypeError — unhandled
-```
-This crashes the WebSocket handler. Only exploitable when `daemon_token` is configured (production
-mode). Impact: connection handler exception, connection closes; no information disclosure.
-
-Fix applied:
-```python
-token = str(parsed.get("token") or "")
-```
-`or ""` coerces `None`/`0`/`False` to `""`. `str()` ensures the type is always `str` before
-`compare_digest`.
-
-**Verification:** `tests/test_websocket_handler.py` 53 passed after fix.
-
----
-
-## Task Status Table
+## Task Status Table (RIO)
 
 | Task | Status | Note |
 |------|--------|------|
-| F-01 · SettingsView General tab case 'general' in loadSettings() | implemented | `SettingsView.tsx:83–91, 167–170` |
-| F-03 · _scrub_log_text on routing_reason, raw_model, error | implemented | `router.py:501,502,538,559` |
-| F-04 · Split _cb_failures → _ss_cb_* / _direct_cb_* | implemented | `router.py:294–300, 493, 523, 540, 545, 629, 641–643` |
-| F-05 · Token moved from URL to first-message auth | implemented | `TerminalPane.tsx:79`, `useTalkPageStream.ts:242`, `websocket_handler.py:204–220`, `pty_routes.py:182–196` |
-| F-05 regression · Auth 5s block in test envs | implemented | Gated on `if daemon_token:` in both handlers |
-| F-06 · _is_model_slug_only provider-prefix gating | implemented | `router.py:187–206` |
-| NEW-HK-1 · WS token null-coercion TypeError | implemented | `websocket_handler.py:214`, `pty_routes.py:191` |
-| Test suite 1803 pass | implemented | 1803 passed, 4 skipped, 4 deselected |
-
----
-
-## Deduplication Log
-
-No cross-layer deduplication required — all HK findings are independent code-level issues.
-OTA and RIO found no additional findings to merge.
+| Routing telemetry (routing_log.py) | implemented | SQLite persisted, server endpoint wired, LogsView consuming |
+| Budget caps (budget.py) | implemented | All caps, formatting, and call log working |
+| Config changes (config.py) | implemented | Vault field excluded from save() after M-01 fix |
+| CLI changes (cli.py) | implemented | Entry point registered |
+| Agent loop (agent_loop.py) | implemented | SwarmSync key import from swarmsync module wired |
+| Server routing endpoint | implemented | `/api/usage/routing` returns `{events, log_path, fields}` |
+| LogsView desktop tab | implemented | Model Routing tab consuming `/api/usage/routing` |
+| Test coverage | implemented | 1804 tests passing |
 
 ---
 
 ## Causal Links
 
-No new causal links. The NEW-HK-1 finding is a standalone code bug in the F-05 fix; it does not
-causally explain any contract or integration failure in the task docs.
+None — the MEDIUM finding (M-01) is a code-level security issue with no associated OTA or RIO failure.
 
 ---
 
 ## Crux
 
-OTA design-time: No structural failure found. All claimed fixes are verified in the code. The O2O
-pipeline delivered authentic, complete fixes for all 5 prior findings. One new LOW finding was
-introduced by the F-05 implementation and has been corrected.
+No structural orchestration failure found. The code is functionally correct; M-01 is a security hygiene gap in config serialization.
 
 ---
 
 ## Remediation Plan
 
-All findings are FIXED. No open remediation items.
+1. **[DONE] MEDIUM code_fix `cato/config.py:save()`** — Exclude `vault` field from YAML output by adding it to a `_RUNTIME_ONLY` exclusion set inside `save()`.
 
-### Completed (this audit)
-**NEW-HK-1 · code_fix · `cato/api/websocket_handler.py:214` + `cato/api/pty_routes.py:191`**
-Changed `parsed.get("token", "")` → `str(parsed.get("token") or "")` to prevent TypeError
-when `"token": null` is sent in the auth envelope. Both files updated.
+2. **LOW code_fix `cato/routing_log.py`** — Add retention sweep every N writes.
+
+3. **LOW code_fix `cato/router.py:630`** — Wire `_direct_cb_open_until` guard into `complete()` loop entry.
+
+4. **LOW code_fix `desktop/src/views/LogsView.tsx:193`** — Replace silent catch with error state display.
+
+5. **LOW code_fix `cato/router.py:947`** — Remove dead `"swarmsync/"` key mapping.
 
 ---
 
 ## Verification Summary
 
-| Command | Result | Scope | Note |
-|---------|--------|-------|------|
-| `python -m pytest tests/test_router.py tests/test_swarmsync*.py -q` | 9 passed | in-scope | Router + SwarmSync fixes verified |
-| `python -m pytest tests/test_websocket_handler.py tests/test_pty_routes_integration.py tests/test_coding_agent_integration.py -q` | 74 passed | in-scope | WS auth regression + F-05 fixes verified |
-| `python -m pytest -q` (full suite) | 1803 passed, 4 skipped | full | No regressions from any fix |
-| `python -m compileall cato/router.py` | passed | in-scope | No syntax errors |
-| Static analysis · SettingsView.tsx:83–91 | `case 'general':` present | in-scope | F-01 verified |
-| Static analysis · router.py:294–300 | `_ss_cb_failures`/`_direct_cb_failures` present; `_cb_failures` absent | in-scope | F-04 verified |
-| Spot-check assertions | all passed | in-scope | F-04, F-06 behaviorally verified |
+| Command | Result | Scope |
+|---------|--------|-------|
+| `pytest tests/test_router.py tests/test_budget.py cato/ui/tests/test_server_lifecycle.py` | 25 passed | in-scope |
+| `pytest --tb=no -q` (full suite) | 1804 passed, 4 skipped | full suite |
+| `python -m compileall cato/config.py cato/router.py cato/routing_log.py cato/budget.py` | OK | compile check |

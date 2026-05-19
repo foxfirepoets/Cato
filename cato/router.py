@@ -248,23 +248,47 @@ def _extract_cost(data: dict[str, Any], *names: str) -> Any:
 
 def _record_routing_decision(record: dict[str, Any]) -> None:
     """Persist one SwarmSync routing decision and keep a short in-memory mirror."""
-    _routing_history.append(record)
+    normalized = {
+        **record,
+        "timestamp": record.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+        "request_id": str(record.get("request_id") or uuid.uuid4()),
+        "routed_model": record.get("routed_model") or record.get("chosen_model") or "",
+        "chosen_model": record.get("chosen_model") or record.get("routed_model") or "",
+        "raw_model": _scrub_log_text(str(record.get("raw_model") or "")),
+        "routing_reason": _scrub_log_text(str(record.get("routing_reason") or "")),
+        "considered_models": _coerce_model_list(record.get("considered_models")),
+        "fallback_routing": bool(record.get("fallback_routing")),
+        "success": bool(record.get("success")),
+        "estimated_cost": record.get("estimated_cost"),
+        "actual_cost": record.get("actual_cost"),
+    }
+    status = "ok" if normalized["success"] else "failed"
+    if normalized["fallback_routing"]:
+        status = "fallback"
+    _routing_history.append(normalized)
     if len(_routing_history) > _ROUTING_HISTORY_MAX:
         del _routing_history[:-_ROUTING_HISTORY_MAX]
     record_routing_event({
         "ts": time.time(),
-        "provider": record.get("provider", "swarmsync"),
-        "status": "ok" if record.get("success") else "fallback",
-        "routed_model": record.get("routed_model") or record.get("chosen_model") or "",
-        "raw_model": record.get("raw_model", ""),
-        "complexity": record.get("complexity_score", 0.0),
-        "has_tools": record.get("has_tools", False),
-        "msg_count": record.get("history_length", 0),
-        "http_status": record.get("http_status"),
-        "content_chars": record.get("content_chars", 0),
-        "tool_call_count": record.get("tool_call_count", 0),
-        "error": record.get("error", ""),
-        "metadata": record,
+        "request_id": normalized["request_id"],
+        "provider": normalized.get("provider", "swarmsync"),
+        "status": status,
+        "success": normalized["success"],
+        "routed_model": normalized["routed_model"],
+        "raw_model": normalized["raw_model"],
+        "routing_reason": normalized["routing_reason"],
+        "considered_models": normalized["considered_models"],
+        "fallback_routing": normalized["fallback_routing"],
+        "estimated_cost": normalized["estimated_cost"],
+        "actual_cost": normalized["actual_cost"],
+        "complexity": normalized.get("complexity_score", 0.0),
+        "has_tools": normalized.get("has_tools", False),
+        "msg_count": normalized.get("history_length", 0),
+        "http_status": normalized.get("http_status"),
+        "content_chars": normalized.get("content_chars", 0),
+        "tool_call_count": normalized.get("tool_call_count", 0),
+        "error": normalized.get("error", ""),
+        "metadata": normalized,
     })
 
 
