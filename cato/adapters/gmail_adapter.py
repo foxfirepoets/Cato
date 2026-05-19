@@ -133,6 +133,17 @@ class GmailAdapter:
 
     async def start(self) -> None:
         """Start the polling loop (run as an asyncio task)."""
+        # Ensure the personal_store schema exists before any poll cycle runs.
+        # init_db is idempotent (CREATE TABLE IF NOT EXISTS), so it's safe to
+        # call on every adapter start. Without this, the first INSERT into
+        # `emails` fails with "no such table: emails" on fresh daemon boots
+        # where no test fixture has primed the DB.
+        try:
+            from cato.core import personal_store  # noqa: PLC0415
+            personal_store.init_db()
+        except Exception as exc:
+            logger.error("Failed to initialise personal_store schema: %s", exc)
+
         self._running = True
         logger.info("GmailAdapter started (poll interval: %ds)", _POLL_INTERVAL)
         while self._running:
