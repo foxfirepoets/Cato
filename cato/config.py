@@ -148,6 +148,39 @@ class CatoConfig:
     # Safety gates
     safety_mode: str = "strict"             # strict | permissive | off
 
+    # Tool-approval policy (per-call user-confirmation gate)
+    #
+    # `auto_approved_tools` lists reversible tools that bypass the
+    # delegation-token gate in `cato.auth.token_checker.TokenChecker`.
+    # The user can still revoke any of these by editing the list.
+    #
+    # `strict_approval` (or CATO_STRICT_APPROVAL=true env var) forces the
+    # original "prompt for everything" behaviour for paranoid mode.
+    #
+    # Only reversible / read-only tools should appear here.  Irreversible
+    # ops (shell.exec, python.execute, file writes, github writes,
+    # integration.action, email send, payments) must continue to gate.
+    auto_approved_tools: list = field(default_factory=lambda: [
+        # Memory — read + write Cato's own SQLite (always safe)
+        "memory.search", "memory.federated",
+        "memory_search", "memory_read",
+        # Web search / research (read-only)
+        "web.search", "web.code", "web.news", "web_search",
+        "academic.arxiv", "academic.semantic_scholar", "academic.pubmed",
+        # Knowledge graph (read-only)
+        "graph.query", "graph.related",
+        # GitHub reads
+        "github.issue_list", "github.pr_list",
+        # Integration status read
+        "integration.status",
+        # Conduit navigation + extraction (read-only browser)
+        "conduit.crawl", "conduit.monitor",
+        "conduit_navigate", "conduit_extract",
+        # Time / config reads
+        "get_time", "get_config", "list_files", "read_file",
+    ])
+    strict_approval: bool = False
+
     # Budget forecast
     budget_forecast_enabled: bool = True    # show cost estimate before tasks
 

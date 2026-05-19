@@ -1370,7 +1370,13 @@ class AgentLoop:
         self._safety = safety_guard or SafetyGuard(config={"safety_mode": getattr(config, "safety_mode", "strict")})
 
         # Token-based authorization checker (T3)
-        self._token_checker = TokenChecker()
+        # Pull the per-call approval policy from config so the user can
+        # extend the auto-approved list or force strict mode without
+        # touching code.  CATO_STRICT_APPROVAL env var overrides config.
+        self._token_checker = TokenChecker(
+            auto_approved_tools=getattr(config, "auto_approved_tools", None) or [],
+            strict_approval=bool(getattr(config, "strict_approval", False)),
+        )
 
         # Register web-search tool actions (Skill 6)
         _register_web_search_tools(vault=vault)

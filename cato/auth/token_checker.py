@@ -3,12 +3,16 @@ cato/auth/token_checker.py — Pre-action scope check for delegation tokens.
 """
 from __future__ import annotations
 
+import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .token_store import TokenStore, ACTION_CATEGORIES
+
+logger = logging.getLogger(__name__)
 
 # Tool-name → action category mapping (extends reversibility registry)
 _DEFAULT_ALLOWED_TOOLS = frozenset({
@@ -95,15 +99,37 @@ class AuthResult:
     requires_user_confirmation: bool
 
 
+def _env_strict_approval() -> bool:
+    """Return True if CATO_STRICT_APPROVAL env var forces strict mode."""
+    val = os.environ.get("CATO_STRICT_APPROVAL", "").strip().lower()
+    return val in {"1", "true", "yes", "y", "on"}
+
+
 class TokenChecker:
-    """Check delegation tokens before executing tool actions."""
+    """Check delegation tokens before executing tool actions.
+
+    The checker supports an `auto_approved_tools` whitelist that
+    short-circuits the gate for known-safe, reversible tools (memory,
+    search, reads).  This avoids the daemon being unable to call its own
+    memory tool just because no delegation token is currently active or
+    because the active token's category list is narrow.
+
+    Strict mode (config field `strict_approval` or env
+    `CATO_STRICT_APPROVAL=true`) restores the original behaviour where
+    every tool must either be in `_DEFAULT_ALLOWED_TOOLS` or covered by
+    an active delegation token.
+    """
 
     def __init__(
         self,
         token_store: Optional[TokenStore] = None,
         db_path: Optional[Path] = None,
+        auto_approved_tools: Optional[Iterable[str]] = None,
+        strict_approval: bool = False,
     ) -> None:
         self._store = token_store or TokenStore(db_path=db_path)
+        self._auto_approved: frozenset[str] = frozenset(auto_approved_tools or [])
+        self._strict: bool = bool(strict_approval) or _env_strict_approval()
 
     def check_authorization(
         self,
@@ -114,6 +140,27 @@ class TokenChecker:
     ) -> AuthResult:
         # Deactivate expired tokens first
         self._store.deactivate_expired()
+
+        # Short-circuit: auto-approve reversible tools (unless strict mode).
+        # This runs BEFORE the delegation-token check so memory.search and
+        # other reversible tools work even when a narrow token is active.
+        if (
+            not self._strict
+            and tool_name in self._auto_approved
+        ):
+            logger.info(
+                "auto-approve tool=%s session=%s reason=auto_approved_tools",
+                tool_name, agent_session_id,
+            )
+            return AuthResult(
+                authorized=True,
+                token_id=None,
+                reason=(
+                    f"Tool '{tool_name}' is in auto_approved_tools "
+                    "(reversible; no per-call user approval required)."
+                ),
+                requires_user_confirmation=False,
+            )
 
         category = _TOOL_CATEGORY_MAP.get(tool_name)
         if category is None:
