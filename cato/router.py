@@ -145,6 +145,7 @@ RouterStreamChunk = str | dict[str, Any]
 # ---------------------------------------------------------------------------
 
 MODEL_TRANSLATIONS: dict[str, str] = {
+    "anthropic/claude-opus-4-7":     "claude-opus-4-7",
     "anthropic/claude-opus-4-6":     "claude-opus-4-6",
     "anthropic/claude-sonnet-4-6":   "claude-sonnet-4-6",
     "anthropic/claude-haiku-4-5":    "claude-haiku-4-5-20251001",
@@ -173,6 +174,7 @@ _PREMIUM = ["claude-opus-4-6", "gemini-2.0-pro-exp", "gpt-4o", "deepseek-reasone
 # (prefix, base_url, auth_scheme)
 _PROVIDERS: list[tuple[str, str, str]] = [
     ("claude-",     "https://api.anthropic.com/v1/messages",                                    "x-api-key"),
+    ("anthropic/",  "https://api.anthropic.com/v1/messages",                                    "x-api-key"),
     ("gpt-",        "https://api.openai.com/v1/chat/completions",                               "bearer"),
     ("o3-",         "https://api.openai.com/v1/chat/completions",                               "bearer"),
     ("gemini-",     "https://generativelanguage.googleapis.com/v1beta/models",                  "google"),
@@ -760,7 +762,9 @@ class ModelRouter:
                 "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
             })
 
-        payload: dict[str, Any] = {"model": model, "max_tokens": self._max_output_tokens,
+        # Strip provider prefix — Anthropic API wants "claude-opus-4-7", not "anthropic/claude-opus-4-7"
+        api_model = model.removeprefix("anthropic/") if model.startswith("anthropic/") else model
+        payload: dict[str, Any] = {"model": api_model, "max_tokens": self._max_output_tokens,
                                    "messages": user_msgs, "stream": True}
         if system:
             payload["system"] = system
