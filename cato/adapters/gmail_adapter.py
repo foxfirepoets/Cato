@@ -35,6 +35,128 @@ _DEFAULT_VOICE_PATH = Path(r"C:\Users\Administrator\Desktop\Ben Assistant\voice\
 _POLL_INTERVAL = 15 * 60  # seconds
 _RATE_LIMIT_SLEEP = 1.1   # seconds between Telegram notifications
 
+# ---------------------------------------------------------------------------
+# Deterministic pre-filter — never draft replies to these.
+# Checked BEFORE any LLM call to save cost and avoid false positives.
+# ---------------------------------------------------------------------------
+
+# Sender patterns — two tiers:
+#
+# _NO_REPLY_EXACT_LOCAL: match only when the local part (before @) is EXACTLY this string.
+# Prevents false-positives on substrings like "info@" matching "yourinfo@company.com".
+#
+# _NO_REPLY_SENDER_SUBSTRINGS: match anywhere in the full address (safe for long unique patterns).
+
+_NO_REPLY_EXACT_LOCAL: frozenset[str] = frozenset({
+    # Role addresses where the EXACT local part means automated/no-reply
+    "noreply",
+    "no-reply",
+    "no_reply",
+    "noreplies",
+    "donotreply",
+    "do-not-reply",
+    "mailer-daemon",
+    "postmaster",
+    "bounce",
+    "bounces",
+    "automated",
+    "auto-confirm",
+    "newsletter",
+    "notifications",
+    "notify",
+    "news",
+    "updates",
+    "alerts",
+    "info",
+    "support",
+    "help",
+    "billing",
+    "receipts",
+    "invoice",
+    "statements",
+    "security",
+    "accounts",
+    "account",
+    "reply",
+})
+
+# Substring patterns — safe to match anywhere (domain-level or unique prefixes)
+_NO_REPLY_SENDER_SUBSTRINGS: tuple[str, ...] = (
+    # Known automated sender domains
+    "accounts.google.com",
+    "googlemail.com",
+    "github.com",
+    "huggingface.co",
+    "notifications.huggingface",
+    "discussions_participating@",
+    "cj.com",
+    "w3.org",
+)
+
+# Subject line substrings — match case-insensitively
+_NO_REPLY_SUBJECT_PATTERNS: tuple[str, ...] = (
+    "unsubscribe",
+    "security alert",
+    "delivery status notification",
+    "mail delivery failed",
+    "failed delivery",
+    "out of office",
+    "auto-reply",
+    "automatic reply",
+    "do not reply",
+    "subscription confirm",
+    "email confirm",
+    "verify your email",
+    "password reset",
+    "account activation",
+    "invoice #",
+    "receipt for",
+    "order confirm",
+    "payment confirm",
+    "your order",
+    "shipment",
+    "tracking number",
+    "meeting invitation",
+    "calendar invitation",
+    "has been deactivated",
+    "group meetings",
+    "tpac",
+    "mailing list",
+    "digest",
+    "weekly summary",
+    "newsletter",
+)
+
+
+def _should_skip_deterministically(from_email: str, subject: str) -> tuple[bool, str]:
+    """Return (True, reason) if this email should be skipped without LLM check.
+
+    Two-tier sender check:
+    1. Exact local-part match — avoids false-positives on substrings.
+       e.g. "info@" would wrongly match "yourinfo@company.com";
+       exact match on local part "info" only fires for "info@anything.tld".
+    2. Substring match on full address — used only for unambiguous domain-level patterns.
+    """
+    from_lower = from_email.lower().strip()
+    subj_lower = subject.lower()
+
+    # Tier 1: exact local-part match
+    if "@" in from_lower:
+        local_part = from_lower.split("@")[0]
+        if local_part in _NO_REPLY_EXACT_LOCAL:
+            return True, f"sender local-part is automated role address '{local_part}'"
+
+    # Tier 2: substring match on full address (domain-level patterns only)
+    for pattern in _NO_REPLY_SENDER_SUBSTRINGS:
+        if pattern in from_lower:
+            return True, f"sender matches no-reply domain pattern '{pattern}'"
+
+    for pattern in _NO_REPLY_SUBJECT_PATTERNS:
+        if pattern in subj_lower:
+            return True, f"subject matches skip pattern '{pattern}'"
+
+    return False, ""
+
 
 def _load_voice_profile() -> str:
     voice_path_env = os.environ.get("BEN_VOICE_PATH", "")
@@ -262,12 +384,17 @@ class GmailAdapter:
     # ------------------------------------------------------------------
 
     async def _is_marketing_email(self, from_email: str, subject: str, snippet: str) -> bool:
+        """LLM-based filter — only called after deterministic pre-filter passes."""
         if self._router is None:
             return False
 
         prompt = (
-            "Is this email marketing/promotional or spam? "
-            "Respond with exactly 'yes' or 'no'. No other text.\n\n"
+            "Should Ben reply to this email, or should it be skipped?\n\n"
+            "Skip if it is ANY of: marketing, promotional, spam, newsletter, "
+            "automated notification, system alert, mailing list, delivery receipt, "
+            "invoice, order confirmation, calendar invite, or any email where "
+            "replying would make no sense (e.g. sent by a robot).\n\n"
+            "Reply 'skip' or 'reply'. No other text.\n\n"
             f"<from>{from_email}</from>\n"
             f"<subject>{subject}</subject>\n"
             f"<snippet>\n{snippet}\n</snippet>"
@@ -278,10 +405,11 @@ class GmailAdapter:
             messages = [{"role": "user", "content": prompt}]
             _model, msg = await self._router._swarmsync_complete_message(messages, api_key, 0.1)
             text = (msg.get("content") or "").strip().lower().rstrip(".")
-            return text == "yes"
+            # Default to skip if response is ambiguous — safer than allowing through
+            return text != "reply"
         except Exception as exc:
-            logger.warning("isMarketingEmail LLM call failed (%s), allowing through", exc)
-            return False
+            logger.warning("isMarketingEmail LLM call failed (%s), defaulting to skip", exc)
+            return True  # safe default: skip rather than auto-draft on LLM failure
 
     async def _draft_email_reply(self, subject: str, body: str, from_email: str) -> str:
         if self._router is None:
@@ -385,14 +513,28 @@ class GmailAdapter:
         if existing:
             return
 
-        # Marketing check via haiku
+        # --- Stage 1: deterministic pre-filter (free, instant) ---
+        skip, reason = _should_skip_deterministically(
+            email_data["from_email"],
+            email_data["subject"],
+        )
+        if skip:
+            logger.info(
+                "Skipped email (pre-filter: %s): %s", reason, email_data["subject"]
+            )
+            await loop.run_in_executor(
+                None, self._mark_as_read_sync, service, gmail_id
+            )
+            return
+
+        # --- Stage 2: LLM filter (only for emails that passed pre-filter) ---
         is_marketing = await self._is_marketing_email(
             email_data["from_email"],
             email_data["subject"],
             email_data["snippet"],
         )
         if is_marketing:
-            logger.info("Skipped marketing email: %s", email_data["subject"])
+            logger.info("Skipped email (LLM filter): %s", email_data["subject"])
             await loop.run_in_executor(
                 None, self._mark_as_read_sync, service, gmail_id
             )
