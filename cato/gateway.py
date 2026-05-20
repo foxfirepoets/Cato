@@ -167,6 +167,11 @@ class Gateway:
         self._pending_responses: dict[str, list[asyncio.Future[dict[str, Any]]]] = {}
         # Activity indicator state (F-01 fix: instance-level, not class-level)
         self._activity_state: dict[str, Any] = {}
+        # One-shot budget bypass flag — set by '/budget bypass' slash command,
+        # consumed by the next ingest().  The agent loop's existing
+        # _budget_bypass_requested() also accepts inline phrases like
+        # "continue anyway", so this flag is an additive shortcut.
+        self._budget_bypass_armed: bool = False
 
     def register_adapter(self, adapter: Any) -> None:
         """Register a channel adapter (must expose start/stop/send)."""
@@ -292,10 +297,19 @@ class Gateway:
             if handled:
                 return
 
+        # Consume one-shot budget bypass flag: append the canonical bypass
+        # phrase to the message so the agent loop's _budget_bypass_requested()
+        # detects it and passes allow_over_budget=True for this turn only.
+        outgoing_message = message
+        if getattr(self, "_budget_bypass_armed", False):
+            self._budget_bypass_armed = False
+            if "continue anyway" not in outgoing_message.lower():
+                outgoing_message = f"{outgoing_message}\n\n[continue anyway]"
+
         lane = self._get_or_create_lane(session_id)
         await lane.enqueue({
             "session_id": session_id,
-            "message":    message,
+            "message":    outgoing_message,
             "channel":    channel,
             "agent_id":   resolved_agent_id,
         })
@@ -325,6 +339,9 @@ class Gateway:
         if cmd == "help":
             await self._cmd_help(session_id, channel)
             return True
+        if cmd == "budget":
+            await self._cmd_budget(session_id, channel, rest)
+            return True
 
         # Heuristic: only treat as an unknown command when it looks like
         # one (alphabetic, no whitespace before the slash, ≤ 32 chars).
@@ -342,10 +359,104 @@ class Gateway:
         """Send the slash-command help text."""
         text = (
             "Slash commands:\n"
-            "  /compact - summarize older conversation turns to free up context\n"
-            "  /help    - show this list"
+            "  /compact            - summarize older conversation turns to free up context\n"
+            "  /budget             - show today's spend, daily cap, monthly cap\n"
+            "  /budget bypass      - allow the next turn to over-spend the daily cap\n"
+            "  /budget daily <amt> - raise the daily cap, e.g. '/budget daily 5'\n"
+            "  /budget monthly <amt> - raise the monthly cap, e.g. '/budget monthly 100'\n"
+            "  /help               - show this list"
         )
         await self.send(session_id, text, channel)
+
+    async def _cmd_budget(self, session_id: str, channel: str, args: str) -> None:
+        """Handle the ``/budget`` slash command.
+
+        Subcommands:
+          (none)              - show current spend and caps
+          bypass              - allow the next turn over the daily cap
+          daily <amount>      - raise the daily cap (USD)
+          monthly <amount>    - raise the monthly cap (USD)
+        """
+        sub, _, sub_rest = args.partition(" ")
+        sub = sub.strip().lower()
+        sub_rest = sub_rest.strip()
+
+        status = self._budget.get_status()
+
+        if not sub:
+            text = (
+                f"Today:   ${status['daily_spend']:.4f} / ${status['daily_cap']:.2f} "
+                f"({status['daily_pct_remaining']:.0f}% remaining, {status['daily_calls']} calls)\n"
+                f"Month:   ${status['monthly_spend']:.4f} / ${status['monthly_cap']:.2f} "
+                f"({status['monthly_pct_remaining']:.0f}% remaining, {status['monthly_calls']} calls)\n"
+                f"All-time: ${status['total_spend_all_time']:.4f}\n"
+                "Use '/budget bypass' to override for one turn, "
+                "'/budget daily <amt>' or '/budget monthly <amt>' to raise a cap."
+            )
+            await self.send(session_id, text, channel)
+            return
+
+        if sub == "bypass":
+            # Mark the next message from this session as bypass-eligible.
+            # The agent loop already understands phrases like 'bypass budget',
+            # so we echo the phrase back and rely on the user's next turn
+            # carrying the bypass intent.  We also record state for the future
+            # one-shot mode (handled by agent_loop's _budget_bypass_requested).
+            text = (
+                "Budget bypass armed. The next message will be allowed to "
+                "over-spend the daily cap one time.  Include the phrase "
+                "'continue anyway' (or simply restate your request) and Cato "
+                "will record the spend as a budget override."
+            )
+            self._budget_bypass_armed = True  # consumed by the next ingest
+            await self.send(session_id, text, channel)
+            return
+
+        if sub in ("daily", "monthly"):
+            if not sub_rest:
+                await self.send(
+                    session_id,
+                    f"Usage: /budget {sub} <amount>  (e.g. '/budget {sub} 5')",
+                    channel,
+                )
+                return
+            try:
+                amount = float(sub_rest.replace("$", "").strip())
+            except ValueError:
+                await self.send(
+                    session_id,
+                    f"Could not parse '{sub_rest}' as a USD amount.",
+                    channel,
+                )
+                return
+            if amount <= 0:
+                await self.send(
+                    session_id, "Amount must be positive.", channel,
+                )
+                return
+            if sub == "daily":
+                self._budget.set_daily_cap(amount)
+                self._cfg.daily_cap = amount
+            else:
+                self._budget.set_monthly_cap(amount)
+                self._cfg.monthly_cap = amount
+            try:
+                self._cfg.save()
+            except Exception as exc:
+                logger.warning("Could not persist config after /budget %s: %s", sub, exc)
+            await self.send(
+                session_id,
+                f"{sub.capitalize()} cap set to ${amount:.2f}.",
+                channel,
+            )
+            return
+
+        await self.send(
+            session_id,
+            f"Unknown /budget subcommand: {sub}. Try '/budget', '/budget bypass', "
+            "'/budget daily <amt>', or '/budget monthly <amt>'.",
+            channel,
+        )
 
     async def _cmd_compact(
         self, session_id: str, channel: str, agent_id: str, args: str,

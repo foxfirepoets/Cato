@@ -1061,8 +1061,37 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "habits",         label: "Habits" },
 ];
 
+function diagnosticsFilename(header: string | null): string {
+  const match = header?.match(/filename="?([^"]+)"?/i);
+  return match?.[1] || "cato-diagnostics.json";
+}
+
 export function DiagnosticsView({ httpPort, wsPort, daemonToken }: DiagnosticsViewProps) {
   const [activeTab, setActiveTab] = useState<TabId>("swarmsync");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const exportDiagnostics = async () => {
+    setExporting(true);
+    setExportError(null);
+    try {
+      const r = await fetch(`http://127.0.0.1:${httpPort}/api/diagnostics/export?limit=200`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = diagnosticsFilename(r.headers.get("Content-Disposition"));
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setExportError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const tabContentStyle: React.CSSProperties = {
     padding: "1.25rem",
@@ -1075,9 +1104,16 @@ export function DiagnosticsView({ httpPort, wsPort, daemonToken }: DiagnosticsVi
 
   return (
     <div style={{ padding: "1.5rem" }}>
-      <h2 style={{ marginBottom: "1.25rem", fontSize: "1.1rem", fontWeight: 700 }}>
-        Diagnostics
-      </h2>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem", marginBottom: "1.25rem" }}>
+        <h2 style={{ margin: 0, fontSize: "1.1rem", fontWeight: 700 }}>
+          Diagnostics
+        </h2>
+        <button className="btn-secondary" onClick={exportDiagnostics} disabled={exporting}>
+          {exporting ? "Exporting..." : "Export Diagnostics"}
+        </button>
+      </div>
+
+      {exportError && <div className="page-error" style={{ marginBottom: "1rem" }}>{exportError}</div>}
 
       {/* Tab bar */}
       <div style={{ display: "flex", borderBottom: "1px solid var(--border, #333)", marginBottom: "0" }}>

@@ -1,32 +1,47 @@
 # CATO Kraken Verdict
 
-**Date:** 2026-05-18
-**Verifier:** Kraken (Independent Verification Agent)
-**Status:** APPROVED
-**Verdict:** GO
+Date: 2026-05-20
+Status: APPROVED
 
 ## Verification Summary
 
-Kraken independently reviewed the changed files, endpoint contracts, persistent routing-log behavior, desktop diagnostics wiring, and test evidence from Alex.
+Kraken independently checked the implementation claims against the repository state and test results.
 
-## Confirmed
+Confirmed:
 
-- `cato doctor` now reports stale pid/port state, daemon `/health`, desktop launcher/exe/shortcut paths, SwarmSync key normalization, `/api/routing/status`, and concrete fix guidance.
-- The desktop launcher normalizes legacy SwarmSync env spelling and prints targeted startup diagnostics instead of only a generic timeout.
-- `AgentLoop` obtains SwarmSync credentials through the shared helper, preserving canonical routing through SwarmSync.
-- SwarmSync routing calls persist a durable SQLite routing log and expose recent events through `/api/usage/routing`.
-- The desktop Diagnostics view includes a SwarmSync live-status card and one-click safe first-message self-test.
-- The Logs routing tab displays persistent routing details, including request id, model, reason, considered models, cost, state, and fallback.
+- Diagnostics export is implemented server-side at `/api/diagnostics/export`, returns a downloadable JSON bundle, includes doctor/routing/log/config evidence, and applies recursive redaction.
+- Desktop export buttons are present in both Logs and Diagnostics views.
+- Approval policy editing is reachable from desktop navigation and persists `strict_approval` plus `auto_approved_tools` through `/api/config`.
+- `/api/config` patch responses no longer expose top-level secret-like keys.
+- Inbox APIs return pending Gmail drafts, notes, todos, and reminders, and approve/dismiss actions update durable SQLite state.
+- Desktop Inbox is wired into the sidebar and app router.
 
-## Independent Test Evidence
+## Evidence
 
-- Full suite: `1803 passed, 4 skipped, 4 deselected`
-- Desktop build: `npm run build:ui` passed
-- Desktop lint: `npm run lint` passed
-- Focused routing and diagnostics suites passed
-- Python compile check passed
-- Diff whitespace check passed
+Commands run:
 
-## Verdict
+```text
+git diff --check
+npm run build:ui
+pytest -q
+```
 
-GO. The diagnostics, SwarmSync status surface, persistent routing telemetry, self-test changes, and lint remediations are verified and may be pushed.
+Results:
+
+- `git diff --check`: passed.
+- `npm run build:ui`: passed.
+- `pytest -q`: `1875 passed, 4 skipped, 4 deselected, 48 warnings`.
+
+Additional focused suite:
+
+```text
+pytest cato/ui/tests/test_server_lifecycle.py tests/test_inbox_api.py tests/test_personal_store.py tests/test_tool_approval_policy.py -q
+```
+
+Result: `53 passed`.
+
+## Push Gate
+
+Kraken verdict: APPROVED.
+
+Git push is authorized for the staged, push-safe files only. Do not include local pytest output logs or unredacted HKO artifacts containing operational secrets.

@@ -1561,12 +1561,24 @@ class AgentLoop:
                     )
                     call_cost = self._budget._last_call_cost
                 except BudgetExceeded as exc:
+                    # Daily / monthly caps are the only enforced gates.
+                    # Surface a clear, actionable message with both bypass and
+                    # cap-raise options.
+                    if exc.cap_type == "daily":
+                        hint = (
+                            f"Today's ${exc.cap_value:.2f} budget is used up. "
+                            "Use '/budget bypass' (or reply 'continue anyway') "
+                            "to override for this turn, or "
+                            f"'/budget daily <amount>' to raise the daily cap."
+                        )
+                    else:
+                        hint = (
+                            f"Monthly ${exc.cap_value:.2f} cap reached. "
+                            "Use '/budget bypass' to override for this turn, or "
+                            f"'/budget monthly <amount>' to raise the monthly cap."
+                        )
                     raise BudgetExceeded(
-                        (
-                            f"{exc} This is a warning gate, not a permanent stop. "
-                            "Reply with 'continue anyway' or 'bypass budget' to run this turn "
-                            "and record the spend as a budget override."
-                        ),
+                        f"{exc}. {hint}",
                         cap_type=exc.cap_type,
                         cap_value=exc.cap_value,
                         current=exc.current,

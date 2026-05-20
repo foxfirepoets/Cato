@@ -93,8 +93,12 @@ class CatoConfig:
     genesis_timeout_s: float = 30.0
 
     # Budget caps (USD)
-    session_cap: float = 3.00
-    monthly_cap: float = 20.00
+    # session_cap is DEPRECATED — retained for backward compatibility but no
+    # longer enforced.  Sessions naturally vary in length and a fixed session
+    # cap interrupted long-running work.  Use daily_cap + monthly_cap instead.
+    session_cap: float = 999.00
+    daily_cap: float = 50.00
+    monthly_cap: float = 100.00
 
     # Workspace
     workspace_dir: str = str(get_data_dir() / "workspace")

@@ -46,7 +46,7 @@ from cato.cli import CatoConfig, Vault, BudgetManager, _CATO_DIR, _run_daemon, _
 vault_path = _CATO_DIR / "vault.enc"
 vault = Vault(vault_path=vault_path) if vault_path.exists() else None
 config = CatoConfig.load()
-budget = BudgetManager(session_cap=config.session_cap, monthly_cap=config.monthly_cap)
+budget = BudgetManager(session_cap=config.session_cap, monthly_cap=config.monthly_cap, daily_cap=config.daily_cap)
 
 # BH-010 — Propagate config.workspace_dir to the file/shell/python tools via
 # an env var.  The tools resolve their workspace root at call time from

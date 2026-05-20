@@ -1,36 +1,53 @@
-# CATO Alex Audit Report
+# CATO Alex Audit
 
-**Date:** 2026-05-18
-**Auditor:** Alex (Audit & Test Agent)
-**Status:** APPROVED
+Date: 2026-05-20
+Status: APPROVED
 
 ## Scope
 
-Reviewed the Cato diagnostics and SwarmSync routing changes:
+Reviewed the pending Cato changes intended for `main`, including:
 
-- `cato doctor` daemon, pid/port, launcher, routing, and SwarmSync key diagnostics.
-- `Launch-CatoDesktop.ps1` startup failure guidance and env-key normalization.
-- SwarmSync key helper and persistent routing log.
-- `/api/routing/status` and `/api/usage/routing` diagnostics payloads.
-- Desktop SwarmSync diagnostics tab, first-message self-test, shared chat transport, and routing log display.
+- Desktop diagnostics export endpoint and download flow.
+- Approval policy editor for `strict_approval` and reversible tool whitelist.
+- Desktop inbox for Gmail drafts, recent notes, todos, and reminders.
+- Budget daily/monthly enforcement updates and related tests.
+- Supporting gateway, doctor, config, dashboard, and service runner updates present in the working tree.
 
-## Findings
+Transient local pytest output files were excluded from the push set. HKO report artifacts containing operational secrets were also excluded.
 
-No blocking issues remain.
+## Review Findings
 
-The implementation keeps LLM routing through SwarmSync when enabled, accepts the legacy `SWARM_SYNC_API_KEY` spelling while reporting that it needs normalization, and records each SwarmSync routing attempt with request id, chosen/raw model, reason, candidates, costs when returned, success/failure, fallback state, and timestamp.
+No blocking findings remain.
+
+Issues found during review and fixed before approval:
+
+- The approval policy editor existed but was not reachable from the desktop shell. Fixed by wiring `SettingsView` into `App.tsx` and `Sidebar.tsx`.
+- `PATCH /api/config` could echo legacy sensitive top-level config values. Fixed by filtering the patch response and adding a regression test.
 
 ## Verification
 
-- `pytest -q`: `1803 passed, 4 skipped, 4 deselected`
-- `pytest tests/test_swarmsync_routing_log.py tests/test_cli_pid_liveness.py tests/test_ui_server_runtime_health.py -q`: `7 passed`
-- `pytest tests/test_router.py cato/ui/tests/test_server_lifecycle.py -q`: `20 passed`
-- `pytest tests/test_swarmsync.py tests/test_swarmsync_routing_log.py -q`: `6 passed`
-- `python -m compileall cato tests\test_swarmsync_routing_log.py`: passed
-- `npm run build:ui`: passed
-- `npm run lint`: passed
-- `git diff --check`: passed with line-ending warnings only
+Commands run:
 
-## Non-Blocking Note
+```text
+git diff --check
+npm run build:ui
+pytest -q
+```
 
-No blocking lint, build, or test issues remain.
+Results:
+
+- `git diff --check`: passed.
+- `npm run build:ui`: passed.
+- `pytest -q`: `1875 passed, 4 skipped, 4 deselected, 48 warnings`.
+
+Focused verification also passed:
+
+```text
+pytest cato/ui/tests/test_server_lifecycle.py tests/test_inbox_api.py tests/test_personal_store.py tests/test_tool_approval_policy.py -q
+```
+
+Result: `53 passed`.
+
+## Approval
+
+Alex verdict: APPROVED.

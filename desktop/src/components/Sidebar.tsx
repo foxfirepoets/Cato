@@ -10,6 +10,7 @@ import logoSrc from "../assets/cato-logo.png";
 export type View =
   | "dashboard"
   | "chat"
+  | "inbox"
   | "coding-agent"
   | "interactive-cli"
   | "skills"
@@ -19,6 +20,7 @@ export type View =
   | "logs"
   | "audit"
   | "memory"
+  | "settings"
   | "config"
   | "budget"
   | "alerts"
@@ -46,6 +48,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: "dashboard",       label: "Dashboard",       icon: "⊞" },
       { id: "chat",           label: "Chat",           icon: "💬" },
+      { id: "inbox",          label: "Inbox",          icon: "✉" },
       { id: "coding-agent",   label: "Coding Agent",   icon: "⌨" },
       { id: "interactive-cli", label: "Interactive CLIs", icon: "🖥" },
     ],
@@ -75,6 +78,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: "system",    label: "System",     icon: "⚙️" },
       { id: "identity",  label: "Identity",   icon: "🪪" },
+      { id: "settings",  label: "Settings",   icon: "☑" },
       { id: "config",    label: "Config",     icon: "⚙" },
       { id: "budget",    label: "Budget",     icon: "$" },
       { id: "alerts",    label: "Alerts",     icon: "🔔" },

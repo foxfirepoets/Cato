@@ -126,6 +126,24 @@ def get_email_by_id(row_id: int) -> dict[str, Any] | None:
         conn.close()
 
 
+def get_pending_email_drafts(limit: int = 25) -> list[dict[str, Any]]:
+    """Return Gmail draft replies awaiting a user decision."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """
+            SELECT * FROM emails
+            WHERE status = 'pending' AND COALESCE(draft_reply, '') != ''
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def update_email_status(row_id: int, status: str) -> None:
     conn = _connect()
     try:
@@ -150,6 +168,24 @@ def update_email_draft_id(row_id: int, gmail_draft_id: str) -> None:
         conn.close()
 
 
+def dismiss_email_draft(row_id: int) -> bool:
+    """Transition a pending or approved draft reply to dismissed."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE emails
+            SET status = 'dismissed'
+            WHERE id = ? AND status IN ('pending', 'approved')
+            """,
+            (row_id,),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
 def claim_email_for_send(row_id: int) -> int | None:
     """Atomically transition status pending→approved.
 
@@ -164,6 +200,29 @@ def claim_email_for_send(row_id: int) -> int | None:
         )
         conn.commit()
         return row_id if cur.rowcount == 1 else None
+    finally:
+        conn.close()
+
+
+def get_approved_email_drafts(limit: int = 25) -> list[dict[str, Any]]:
+    """Return approved Gmail drafts that have not been marked sent.
+
+    Desktop approval uses this durable state when no live GmailAdapter instance
+    is available in the HTTP server process. A Gmail sender can safely pick up
+    these rows later and mark them ``sent`` after ``gmail_draft_id`` is sent.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """
+            SELECT * FROM emails
+            WHERE status = 'approved'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -196,6 +255,42 @@ def get_todos_and_reminders() -> list[dict[str, Any]]:
             WHERE category IN ('todo', 'reminder') AND status = 'open'
             ORDER BY created_at ASC
             """,
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_open_todos(limit: int = 25) -> list[dict[str, Any]]:
+    """Return open todo notes ordered by creation date."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """
+            SELECT * FROM notes
+            WHERE category = 'todo' AND status = 'open'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_open_reminders(limit: int = 25) -> list[dict[str, Any]]:
+    """Return open reminder notes ordered by due date when present."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """
+            SELECT * FROM notes
+            WHERE category = 'reminder' AND status = 'open'
+            ORDER BY COALESCE(due_date, created_at) ASC, created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
         )
         return [dict(r) for r in cur.fetchall()]
     finally:

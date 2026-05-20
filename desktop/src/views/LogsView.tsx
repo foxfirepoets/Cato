@@ -92,6 +92,11 @@ function formatRouteTime(entry: RoutingEntry): string {
   return "-";
 }
 
+function filenameFromDisposition(header: string | null): string {
+  const match = header?.match(/filename="?([^"]+)"?/i);
+  return match?.[1] || "cato-diagnostics.json";
+}
+
 /* ── Daemon Logs Tab ── */
 const DaemonLogsTab: React.FC<{ base: string }> = ({ base }) => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -359,12 +364,39 @@ const ModelRoutingTab: React.FC<{ base: string }> = ({ base }) => {
 export const LogsView: React.FC<LogsViewProps> = ({ httpPort }) => {
   const base = `http://127.0.0.1:${httpPort}`;
   const [tab, setTab] = useState<"logs" | "routing">("logs");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const exportDiagnostics = async () => {
+    setExporting(true);
+    setExportError(null);
+    try {
+      const r = await fetch(`${base}/api/diagnostics/export?limit=200`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filenameFromDisposition(r.headers.get("Content-Disposition"));
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setExportError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  };
 
   return (
     <div className="page-view">
       <div className="page-header">
         <h1 className="page-title">Logs</h1>
         <div className="page-controls">
+          <button className="btn-secondary" onClick={exportDiagnostics} disabled={exporting}>
+            {exporting ? "Exporting..." : "Export Diagnostics"}
+          </button>
           <div style={{ display: "flex", gap: 0, borderRadius: 6, overflow: "hidden", border: "1px solid var(--border-secondary, #2a2a3e)" }}>
             <button
               onClick={() => setTab("logs")}
@@ -393,6 +425,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ httpPort }) => {
         </div>
       </div>
 
+      {exportError && <div className="page-error">{exportError}</div>}
       {tab === "logs" ? <DaemonLogsTab base={base} /> : <ModelRoutingTab base={base} />}
     </div>
   );

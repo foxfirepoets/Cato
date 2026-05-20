@@ -1,9 +1,14 @@
 """
 cato/budget.py — Spending cap enforcement for CATO.
 
-Tracks per-call, per-session, and monthly LLM spend across all 16 supported
-models.  Raises BudgetExceeded before any call that would breach a cap.
-State is persisted as human-readable JSON at ~/.cato/budget.json.
+Tracks per-call, per-day, and per-month LLM spend across all 16 supported
+models.  Raises BudgetExceeded before any call that would breach a daily or
+monthly cap.  State is persisted as human-readable JSON at ~/.cato/budget.json.
+
+The legacy per-session cap is retained as an informational field for
+backwards compatibility, but it no longer gates calls — sessions naturally
+vary in length and a fixed session cap interrupted long-running work.
+Daily + monthly caps are the canonical enforcement layer.
 """
 
 from __future__ import annotations
@@ -88,7 +93,7 @@ class BudgetExceeded(Exception):
 
 class BudgetManager:
     """
-    Tracks LLM spending and enforces session and monthly caps.
+    Tracks LLM spending and enforces daily and monthly caps.
 
     All monetary amounts are in USD.
 
@@ -98,17 +103,27 @@ class BudgetManager:
         cost = bm.estimate_cost("claude-sonnet-4-6", 1000, 500)
         bm.check_and_deduct("claude-sonnet-4-6", 1000, 500)
         print(bm.format_footer())
+
+    Notes:
+        * ``session_cap`` is accepted for backward compatibility but is NOT
+          enforced.  It is logged at INFO and persisted as an informational
+          field so existing call sites and config files keep working.
+        * ``daily_cap`` is the canonical short-horizon guard (default $3).
+        * ``monthly_cap`` is the long-horizon backstop (default $20).
     """
 
     def __init__(
         self,
         session_cap: float = 3.00,
         monthly_cap: float = 20.00,
+        daily_cap: float = 3.00,
         budget_path: Optional[Path] = None,
     ) -> None:
         self._path = budget_path or _BUDGET_FILE
+        # session_cap retained for backward compat; informational only
         self._session_cap = session_cap
         self._monthly_cap = monthly_cap
+        self._daily_cap = daily_cap
 
         # NOTE: Using float for monetary values. Accumulated rounding error is ~$0.01
         # over 100,000 calls at $0.001/call. Use decimal.Decimal in a future version
@@ -124,13 +139,27 @@ class BudgetManager:
             self._session_cap = self._state["session_cap"]
         if "monthly_cap" in self._state:
             self._monthly_cap = self._state["monthly_cap"]
+        if "daily_cap" in self._state:
+            self._daily_cap = self._state["daily_cap"]
+
+        # Persist the canonical caps back so on-disk file reflects current
+        # configuration even after migration from a session-cap-only file.
+        self._state["session_cap"] = self._session_cap
+        self._state["monthly_cap"] = self._monthly_cap
+        self._state["daily_cap"] = self._daily_cap
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
     def _load(self) -> dict:
-        """Load budget state from disk, returning defaults on first run."""
+        """Load budget state from disk, returning defaults on first run.
+
+        Performs forward-migration:
+          * Adds ``daily_cap`` and ``daily_spend`` if missing.
+          * Rolls over ``monthly_spend`` when the calendar month changes.
+          * Rolls over ``daily_spend`` when the UTC date changes.
+        """
         if not self._path.exists():
             return self._default_state()
         try:
@@ -141,6 +170,16 @@ class BudgetManager:
                 data["monthly_spend"] = 0.0
                 data["month_key"] = now_month
                 data["monthly_calls"] = 0
+            # Roll over if we're in a new UTC day
+            now_day = _current_day_key()
+            if data.get("day_key") != now_day:
+                data["daily_spend"] = 0.0
+                data["day_key"] = now_day
+                data["daily_calls"] = 0
+            # Ensure migrated fields exist for files written before daily caps
+            data.setdefault("daily_spend", 0.0)
+            data.setdefault("daily_calls", 0)
+            data.setdefault("day_key", _current_day_key())
             return data
         except (json.JSONDecodeError, KeyError):
             return self._default_state()
@@ -150,8 +189,12 @@ class BudgetManager:
             "month_key": _current_month_key(),
             "monthly_spend": 0.0,
             "monthly_calls": 0,
+            "day_key": _current_day_key(),
+            "daily_spend": 0.0,
+            "daily_calls": 0,
             "session_cap": self._session_cap,
             "monthly_cap": self._monthly_cap,
+            "daily_cap": self._daily_cap,
             "total_spend_all_time": 0.0,
             "call_log": [],          # last N calls for audit trail
         }
@@ -196,37 +239,58 @@ class BudgetManager:
         allow_over_budget: bool = False,
     ) -> float:
         """
-        Validate spend against caps, deduct if within budget, persist state.
+        Validate spend against daily and monthly caps, deduct if within budget,
+        persist state.
 
         Returns the cost of the call.
-        Raises BudgetExceeded if either session or monthly cap would be breached,
-        unless allow_over_budget=True.
-        Thread-safe via asyncio.Lock.
+
+        Raises BudgetExceeded if either the daily or monthly cap would be
+        breached, unless ``allow_over_budget=True``.
+
+        The per-session cap is NOT enforced here — it is retained as an
+        informational field on the persisted state for backward compatibility.
+
+        Thread-safe via ``asyncio.Lock``.
         """
         async with self._lock:
+            # Day rollover check inside the lock — guarantees correctness even
+            # if the BudgetManager outlives a UTC day boundary.
+            now_day = _current_day_key()
+            if self._state.get("day_key") != now_day:
+                self._state["daily_spend"] = 0.0
+                self._state["daily_calls"] = 0
+                self._state["day_key"] = now_day
+
+            now_month = _current_month_key()
+            if self._state.get("month_key") != now_month:
+                self._state["monthly_spend"] = 0.0
+                self._state["monthly_calls"] = 0
+                self._state["month_key"] = now_month
+
             cost = self.estimate_cost(model, input_tokens, output_tokens)
             override_reasons: list[str] = []
 
-            # Session cap check
-            if self._session_spend + cost > self._session_cap:
+            # Daily cap check — the canonical short-horizon guard
+            daily = float(self._state.get("daily_spend", 0.0))
+            if daily + cost > self._daily_cap:
                 if not allow_over_budget:
                     raise BudgetExceeded(
-                        f"Session cap ${self._session_cap:.2f} would be exceeded "
-                        f"(current ${self._session_spend:.4f}, call ${cost:.4f})",
-                        cap_type="session",
-                        cap_value=self._session_cap,
-                        current=self._session_spend,
+                        f"Daily cap ${self._daily_cap:.2f} would be exceeded "
+                        f"(today ${daily:.4f}, call ${cost:.4f})",
+                        cap_type="daily",
+                        cap_value=self._daily_cap,
+                        current=daily,
                         call_cost=cost,
                     )
-                override_reasons.append("session")
+                override_reasons.append("daily")
 
-            # Monthly cap check
-            monthly = self._state["monthly_spend"]
+            # Monthly cap check — long-horizon backstop
+            monthly = float(self._state.get("monthly_spend", 0.0))
             if monthly + cost > self._monthly_cap:
                 if not allow_over_budget:
                     raise BudgetExceeded(
                         f"Monthly cap ${self._monthly_cap:.2f} would be exceeded "
-                        f"(current ${monthly:.4f}, call ${cost:.4f})",
+                        f"(month ${monthly:.4f}, call ${cost:.4f})",
                         cap_type="monthly",
                         cap_value=self._monthly_cap,
                         current=monthly,
@@ -237,6 +301,8 @@ class BudgetManager:
             # Deduct
             self._session_spend += cost
             self._last_call_cost = cost
+            self._state["daily_spend"] = round(daily + cost, 8)
+            self._state["daily_calls"] = self._state.get("daily_calls", 0) + 1
             self._state["monthly_spend"] = round(monthly + cost, 8)
             self._state["monthly_calls"] = self._state.get("monthly_calls", 0) + 1
             self._state["total_spend_all_time"] = round(
@@ -265,17 +331,28 @@ class BudgetManager:
         Return a dict with current spend, caps, and percentage remaining.
 
         Keys: session_spend, session_cap, session_pct_remaining,
+              daily_spend, daily_cap, daily_pct_remaining, daily_calls, day_key,
               monthly_spend, monthly_cap, monthly_pct_remaining,
               monthly_calls, total_spend_all_time, month_key.
+
+        Note: ``session_cap`` / ``session_pct_remaining`` are informational —
+        they are NOT enforced.  Daily + monthly are the real caps.
         """
-        monthly = self._state["monthly_spend"]
-        monthly_pct = max(0.0, (self._monthly_cap - monthly) / self._monthly_cap * 100)
-        session_pct = max(0.0, (self._session_cap - self._session_spend) / self._session_cap * 100)
+        daily = float(self._state.get("daily_spend", 0.0))
+        monthly = float(self._state.get("monthly_spend", 0.0))
+        daily_pct = max(0.0, (self._daily_cap - daily) / self._daily_cap * 100) if self._daily_cap > 0 else 100.0
+        monthly_pct = max(0.0, (self._monthly_cap - monthly) / self._monthly_cap * 100) if self._monthly_cap > 0 else 100.0
+        session_pct = max(0.0, (self._session_cap - self._session_spend) / self._session_cap * 100) if self._session_cap > 0 else 100.0
 
         return {
             "session_spend": round(self._session_spend, 6),
             "session_cap": self._session_cap,
             "session_pct_remaining": round(session_pct, 1),
+            "daily_spend": round(daily, 6),
+            "daily_cap": self._daily_cap,
+            "daily_pct_remaining": round(daily_pct, 1),
+            "daily_calls": self._state.get("daily_calls", 0),
+            "day_key": self._state.get("day_key", _current_day_key()),
             "monthly_spend": round(monthly, 6),
             "monthly_cap": self._monthly_cap,
             "monthly_pct_remaining": round(monthly_pct, 1),
@@ -288,13 +365,14 @@ class BudgetManager:
         """
         Return a one-line budget summary suitable for appending to agent responses.
 
-        Example: [$0.003 this call | Month: $1.24/$20.00 | 75% remaining]
+        Example:
+            [$0.003 this call | Today: $0.42/$3.00 | Month: $1.24/$20.00]
         """
         status = self.get_status()
         return (
             f"[${self._last_call_cost:.4f} this call"
-            f" | Month: ${status['monthly_spend']:.2f}/${status['monthly_cap']:.2f}"
-            f" | {status['monthly_pct_remaining']:.0f}% remaining]"
+            f" | Today: ${status['daily_spend']:.2f}/${status['daily_cap']:.2f}"
+            f" | Month: ${status['monthly_spend']:.2f}/${status['monthly_cap']:.2f}]"
         )
 
     # ------------------------------------------------------------------
@@ -302,7 +380,10 @@ class BudgetManager:
     # ------------------------------------------------------------------
 
     def set_session_cap(self, cap: float) -> None:
-        """Update the session cap and persist."""
+        """Update the (informational) session cap and persist.
+
+        Retained for backward compatibility — the session cap is not enforced.
+        """
         self._session_cap = cap
         self._state["session_cap"] = cap
         self._save()
@@ -311,6 +392,12 @@ class BudgetManager:
         """Update the monthly cap and persist."""
         self._monthly_cap = cap
         self._state["monthly_cap"] = cap
+        self._save()
+
+    def set_daily_cap(self, cap: float) -> None:
+        """Update the daily cap and persist."""
+        self._daily_cap = cap
+        self._state["daily_cap"] = cap
         self._save()
 
     def reset_session(self) -> None:
@@ -385,7 +472,7 @@ class BudgetManager:
         Returns True if the user confirms (or auto_confirm=True / estimate is free).
         Prints a summary: "Estimated cost: $X.XX (...). Proceed? [Y/n]"
 
-        Also emits BUDGET_ALERT_THRESHOLDS warnings if session budget is running low.
+        Also emits BUDGET_ALERT_THRESHOLDS warnings if daily budget is running low.
         """
         if auto_confirm:
             return True
@@ -393,17 +480,19 @@ class BudgetManager:
         total_usd = estimate["total_cents"] / 100
         breakdown = estimate.get("breakdown", "")
 
-        # Check alert thresholds against session budget remaining
-        session_pct = max(
+        # Check alert thresholds against daily budget remaining (the canonical
+        # short-horizon guard — session cap is informational only).
+        daily = float(self._state.get("daily_spend", 0.0))
+        daily_pct = max(
             0.0,
-            (self._session_cap - self._session_spend) / self._session_cap * 100
-        ) if self._session_cap > 0 else 100.0
+            (self._daily_cap - daily) / self._daily_cap * 100
+        ) if self._daily_cap > 0 else 100.0
 
         for threshold in BUDGET_ALERT_THRESHOLDS:
-            if session_pct <= threshold:
+            if daily_pct <= threshold:
                 _safe_print(
-                    f"[BUDGET ALERT] Only {session_pct:.0f}% of session budget remaining "
-                    f"(${self._session_spend:.4f} / ${self._session_cap:.2f} used)."
+                    f"[BUDGET ALERT] Only {daily_pct:.0f}% of today's budget remaining "
+                    f"(${daily:.4f} / ${self._daily_cap:.2f} used)."
                 )
                 break
 
@@ -435,6 +524,11 @@ class BudgetManager:
 def _current_month_key() -> str:
     """Return 'YYYY-MM' for the current UTC month."""
     return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _current_day_key() -> str:
+    """Return 'YYYY-MM-DD' for the current UTC day."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def _safe_print(text: str) -> None:

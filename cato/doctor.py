@@ -144,8 +144,8 @@ class DoctorReport:
             self._config = CatoConfig.load(config_path)
             console.print(f"  [green]OK[/green] — {config_path}")
             console.print(f"     model: {self._config.default_model}")
-            console.print(f"     monthly cap: ${self._config.monthly_cap:.2f}"
-                          f"  |  session cap: ${self._config.session_cap:.2f}")
+            console.print(f"     daily cap: ${self._config.daily_cap:.2f}"
+                          f"  |  monthly cap: ${self._config.monthly_cap:.2f}")
         except Exception as exc:
             console.print(f"  [red]INVALID[/red] — {exc}")
             self._fail("Config file is invalid", f"Fix YAML at {config_path}: {exc}")
@@ -240,19 +240,23 @@ class DoctorReport:
         try:
             cfg = self._config
             bm = BudgetManager(
-                session_cap=cfg.session_cap if cfg else 1.00,
+                session_cap=cfg.session_cap if cfg else 3.00,
                 monthly_cap=cfg.monthly_cap if cfg else 20.00,
+                daily_cap=cfg.daily_cap if cfg else 3.00,
             )
             status = bm.get_status()
+            daily_color = "red" if status["daily_pct_remaining"] < 20 else "green"
             monthly_color = "red" if status["monthly_pct_remaining"] < 20 else "green"
+            console.print(
+                f"  Today:    ${status['daily_spend']:.4f} / ${status['daily_cap']:.2f}"
+                f"  [{daily_color}]({status['daily_pct_remaining']:.0f}% remaining)[/{daily_color}]"
+            )
             console.print(
                 f"  Monthly:  ${status['monthly_spend']:.4f} / ${status['monthly_cap']:.2f}"
                 f"  [{monthly_color}]({status['monthly_pct_remaining']:.0f}% remaining)[/{monthly_color}]"
             )
-            console.print(
-                f"  Session:  ${status['session_spend']:.4f} / ${status['session_cap']:.2f}"
-            )
             console.print(f"  All-time: ${status['total_spend_all_time']:.4f}")
+            console.print(f"  Calls today:      {status['daily_calls']}")
             console.print(f"  Calls this month: {status['monthly_calls']}")
         except Exception as exc:
             console.print(f"  [red]Could not read budget: {exc}[/red]")

@@ -275,6 +275,106 @@ async def test_usage_routing_returns_evidence_contract(monkeypatch):
         assert event["timestamp"] == "2026-05-19T12:00:00+00:00"
 
 
+@pytest.mark.asyncio
+async def test_diagnostics_export_returns_attachment_bundle(monkeypatch):
+    """Diagnostics export bundles doctor, routing, usage events, logs, and config."""
+    class FakeConfig:
+        swarmsync_enabled = True
+        swarmsync_api_url = "https://api.swarmsync.invalid/v1/chat/completions"
+        default_model = "openrouter/minimax/minimax-m2.5"
+
+        def to_dict(self):
+            return {
+                "swarmsync_enabled": True,
+                "swarmsync_api_url": self.swarmsync_api_url,
+                "default_model": self.default_model,
+                "telegram_bot_token": "123456789:telegram-secret-token",
+                "nested": {"api_key": "sk-live-secretvalue"},
+            }
+
+    vault = MagicMock()
+    vault.get.side_effect = lambda key: {
+        "SWARMSYNC_API_KEY": "ssync-super-secret-key",
+        "OPENROUTER_API_KEY": "sk-openrouter-secret",
+    }.get(key, "")
+    gateway = MagicMock()
+    gateway._cfg = FakeConfig()
+    gateway._vault = vault
+    gateway._lanes = {}
+
+    monkeypatch.setenv("SWARMSYNC_API_KEY", "")
+    monkeypatch.setattr(
+        "cato.router.get_routing_history",
+        lambda: [
+            {
+                "request_id": "req-diag-1",
+                "routing_reason": "used SWARMSYNC_API_KEY=ssync-super-secret-key",
+                "error": "Bearer sk-live-secretvalue",
+            }
+        ],
+    )
+
+    async def fake_doctor_output():
+        return {
+            "status": "ok",
+            "output": "doctor ok token=doctor-secret",
+            "failures": [],
+        }
+
+    monkeypatch.setattr(server_module, "_collect_doctor_output", fake_doctor_output)
+    monkeypatch.setattr(
+        server_module,
+        "_collect_daemon_log_files",
+        lambda: [
+            {
+                "path": "daemon.log",
+                "tail": "password=hunter2 api_key=sk-live-secretvalue",
+            }
+        ],
+    )
+
+    app = await create_ui_app(gateway=gateway)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/diagnostics/export?limit=1", headers=_auth_headers())
+        assert resp.status == 200
+        assert resp.headers["Content-Disposition"].startswith('attachment; filename="cato-diagnostics-')
+        data = await resp.json()
+
+    assert data["schema_version"] == 1
+    assert data["doctor"]["status"] == "ok"
+    assert data["routing_status"]["swarmsync_enabled"] is True
+    assert data["routing_status"]["live_test"]["skipped"] is True
+    assert data["routing_events"][0]["request_id"] == "req-diag-1"
+    assert data["logs"]["files"][0]["path"] == "daemon.log"
+
+    serialized = json.dumps(data)
+    assert "telegram-secret-token" not in serialized
+    assert "ssync-super-secret-key" not in serialized
+    assert "sk-live-secretvalue" not in serialized
+    assert "hunter2" not in serialized
+    assert "[redacted]" in serialized
+
+
+def test_diagnostics_redaction_recurses_config_style_fields():
+    """Diagnostics redaction catches nested config/vault/key/token/password fields."""
+    payload = {
+        "vault": {"OPENROUTER_API_KEY": "sk-live-secretvalue"},
+        "auth": {"token": "abc123"},
+        "nested": [{"password": "hunter2"}, {"message": "Bearer abc.def.ghi"}],
+        "safe": "plain text",
+    }
+
+    redacted = server_module._redact_diagnostics_data(payload)
+    serialized = json.dumps(redacted)
+
+    assert "sk-live-secretvalue" not in serialized
+    assert "abc123" not in serialized
+    assert "hunter2" not in serialized
+    assert "Bearer abc.def.ghi" not in serialized
+    assert redacted["safe"] == "plain text"
+
+
 # ------------------------------------------------------------------ #
 # Config endpoint                                                     #
 # ------------------------------------------------------------------ #
@@ -303,6 +403,86 @@ async def test_config_post_invalid_json_returns_400():
             headers=_auth_headers({"Content-Type": "application/json"}),
         )
         assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_config_get_includes_approval_policy_defaults(tmp_path):
+    """GET /api/config exposes desktop approval policy fields."""
+    with patch("cato.platform.get_data_dir", return_value=tmp_path):
+        app = await create_ui_app()
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/config", headers=_auth_headers())
+            assert resp.status == 200
+            data = await resp.json()
+
+    assert data["strict_approval"] is False
+    assert isinstance(data["auto_approved_tools"], list)
+    assert "memory.search" in data["auto_approved_tools"]
+
+
+@pytest.mark.asyncio
+async def test_config_patch_persists_approval_policy(tmp_path):
+    """PATCH /api/config persists strict_approval and auto_approved_tools."""
+    import yaml
+
+    with patch("cato.platform.get_data_dir", return_value=tmp_path):
+        app = await create_ui_app()
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.patch(
+                "/api/config",
+                json={
+                    "strict_approval": True,
+                    "auto_approved_tools": ["memory.search", "web.search"],
+                },
+                headers=_auth_headers(),
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+    persisted = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["config"]["strict_approval"] is True
+    assert data["config"]["auto_approved_tools"] == ["memory.search", "web.search"]
+    assert persisted["strict_approval"] is True
+    assert persisted["auto_approved_tools"] == ["memory.search", "web.search"]
+
+
+@pytest.mark.asyncio
+async def test_config_patch_response_redacts_sensitive_keys(tmp_path):
+    """PATCH /api/config must not echo plaintext legacy secrets."""
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "telegram_bot_token": "123456789:secret-token",
+                "openrouter_api_key": "sk-secret",
+                "default_model": "openrouter/minimax/minimax-m2.5",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("cato.platform.get_data_dir", return_value=tmp_path):
+        app = await create_ui_app()
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.patch(
+                "/api/config",
+                json={"strict_approval": True},
+                headers=_auth_headers(),
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+    serialized = json.dumps(data)
+    assert "telegram_bot_token" not in data["config"]
+    assert "openrouter_api_key" not in data["config"]
+    assert "secret-token" not in serialized
+    assert "sk-secret" not in serialized
+    assert data["config"]["strict_approval"] is True
 
 
 # ------------------------------------------------------------------ #

@@ -103,6 +103,62 @@ def test_update_email_draft_id():
     assert row["gmail_draft_id"] == "new-draft-id"
 
 
+def test_get_pending_email_drafts_excludes_processed_rows():
+    pending_id = store.save_email(
+        gmail_message_id="pending001",
+        subject="Needs review",
+        from_email="sender@example.com",
+        snippet="hello",
+        draft_reply="Thanks.",
+        gmail_draft_id="draft-003",
+    )
+    dismissed_id = store.save_email(
+        gmail_message_id="dismissed001",
+        subject="Dismissed",
+        from_email="sender@example.com",
+        snippet="hello",
+        draft_reply="No reply.",
+        gmail_draft_id="draft-004",
+    )
+    store.update_email_status(dismissed_id, "dismissed")
+
+    drafts = store.get_pending_email_drafts()
+
+    assert [d["id"] for d in drafts] == [pending_id]
+
+
+def test_dismiss_email_draft_only_changes_open_review_states():
+    row_id = store.save_email(
+        gmail_message_id="dismiss001",
+        subject="Dismiss me",
+        from_email="sender@example.com",
+        snippet="hello",
+        draft_reply="Reply",
+        gmail_draft_id="draft-005",
+    )
+
+    assert store.dismiss_email_draft(row_id) is True
+    assert store.get_email_by_id(row_id)["status"] == "dismissed"
+    assert store.dismiss_email_draft(row_id) is False
+
+
+def test_get_approved_email_drafts_supports_deferred_desktop_send():
+    row_id = store.save_email(
+        gmail_message_id="approved001",
+        subject="Approve me",
+        from_email="sender@example.com",
+        snippet="hello",
+        draft_reply="Reply",
+        gmail_draft_id="draft-006",
+    )
+    assert store.claim_email_for_send(row_id) == row_id
+
+    approved = store.get_approved_email_drafts()
+
+    assert len(approved) == 1
+    assert approved[0]["id"] == row_id
+
+
 # ---------------------------------------------------------------------------
 # Note tests
 # ---------------------------------------------------------------------------
@@ -160,3 +216,15 @@ def test_get_recent_notes_respects_limit():
 
     notes = store.get_recent_notes(5)
     assert len(notes) == 5
+
+
+def test_get_open_todos_and_reminders_split_categories():
+    todo_id = store.save_note("Open task", "todo")
+    reminder_id = store.save_note("Call Sam", "reminder", due_date="2026-06-10")
+    store.save_note("Memory", "memory")
+
+    todos = store.get_open_todos()
+    reminders = store.get_open_reminders()
+
+    assert [t["id"] for t in todos] == [todo_id]
+    assert [r["id"] for r in reminders] == [reminder_id]

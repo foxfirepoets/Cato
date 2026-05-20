@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar, type View } from "./components/Sidebar";
 import { ChatView } from "./views/ChatView";
+import { InboxView } from "./views/InboxView";
 import type { ChatConnectionStatus } from "./hooks/useChatStream";
 import { CodingAgentView } from "./views/CodingAgentView";
 import { InteractiveCLIView } from "./views/InteractiveCLIView";
@@ -21,6 +22,7 @@ import { UsageView } from "./views/UsageView";
 import { LogsView } from "./views/LogsView";
 import { AuditLogView } from "./views/AuditLogView";
 import { ConfigView } from "./views/ConfigView";
+import { SettingsView } from "./views/SettingsView";
 import { BudgetView } from "./views/BudgetView";
 import { AlertsView } from "./views/AlertsView";
 import { AuthKeysView } from "./views/AuthKeysView";
@@ -136,6 +138,8 @@ function renderView(view: View, daemon: DaemonInfo, onNavigate: (v: View) => voi
       return <DashboardView httpPort={httpPort} onNavigate={onNavigate} />;
     case "chat":
       return <ChatView wsBase={`127.0.0.1:${wsPort}`} httpPort={httpPort} daemonToken={daemon.daemonToken} />;
+    case "inbox":
+      return <InboxView httpPort={httpPort} />;
     case "coding-agent":
       return (
         <CodingAgentView
@@ -160,6 +164,8 @@ function renderView(view: View, daemon: DaemonInfo, onNavigate: (v: View) => voi
       return <AuditLogView httpPort={httpPort} />;
     case "config":
       return <ConfigView httpPort={httpPort} />;
+    case "settings":
+      return <SettingsView httpPort={httpPort} />;
     case "budget":
       return <BudgetView httpPort={httpPort} />;
     case "alerts":

@@ -111,6 +111,7 @@
 
 .setting-group input[type='text'],
 .setting-group input[type='number'],
+.setting-group textarea,
 .setting-group select {
   width: 100%;
   padding: 10px 12px;
@@ -124,10 +125,18 @@
 
 .setting-group input[type='text']:focus,
 .setting-group input[type='number']:focus,
+.setting-group textarea:focus,
 .setting-group select:focus {
   outline: none;
   border-color: #3b82f6;
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.setting-group textarea {
+  min-height: 180px;
+  resize: vertical;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  line-height: 1.5;
 }
 
 .setting-group input[type='text']:read-only {
@@ -145,6 +154,86 @@
 .setting-group strong {
   font-weight: 600;
   color: #1f2937;
+}
+
+/* Approval Policy */
+.approval-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-flex !important;
+  width: 44px;
+  height: 24px;
+  margin-bottom: 0 !important;
+  flex: 0 0 auto;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-switch span {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: #d1d5db;
+  border-radius: 999px;
+  transition: background 0.2s ease;
+}
+
+.toggle-switch span::before {
+  content: '';
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  left: 3px;
+  top: 3px;
+  background: white;
+  border-radius: 50%;
+  transition: transform 0.2s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.toggle-switch input:checked + span {
+  background: #3b82f6;
+}
+
+.toggle-switch input:checked + span::before {
+  transform: translateX(20px);
+}
+
+.policy-summary {
+  padding: 12px 14px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  color: #374151;
+  font-size: 14px;
+}
+
+.tool-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tool-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 9px;
+  background: #f3f4f6;
+  color: #374151;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 /* Channel Section */

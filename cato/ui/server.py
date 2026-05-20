@@ -42,12 +42,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import os
 import re
 import secrets
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -130,6 +132,221 @@ def _redact_log_text(text: str) -> str:
         else:
             redacted = pattern.sub("[redacted]", redacted)
     return redacted
+
+
+_SENSITIVE_DIAGNOSTIC_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "api-key",
+    "_key",
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "authorization",
+    "bearer",
+    "vault",
+)
+
+
+def _is_sensitive_diagnostic_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(part in lowered for part in _SENSITIVE_DIAGNOSTIC_KEY_PARTS)
+
+
+def _redact_diagnostics_data(value: Any, key: str = "") -> Any:
+    """Recursively redact diagnostics payloads before returning them to the UI."""
+    if key and _is_sensitive_diagnostic_key(key):
+        if isinstance(value, (bool, int, float)) or value is None:
+            return value
+        return "[redacted]" if value else value
+
+    if isinstance(value, dict):
+        return {
+            str(k): _redact_diagnostics_data(v, str(k))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_diagnostics_data(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_diagnostics_data(item) for item in value]
+    if isinstance(value, str):
+        return _redact_log_text(value)
+    return value
+
+
+async def _collect_doctor_output() -> dict[str, Any]:
+    """Run cato doctor and capture its printable report for diagnostics export."""
+    loop = asyncio.get_running_loop()
+
+    def _run() -> dict[str, Any]:
+        buf = io.StringIO()
+        try:
+            import cato.doctor as doctor_module
+            from rich.console import Console
+
+            previous_console = doctor_module.console
+            doctor_module.console = Console(
+                file=buf,
+                force_terminal=False,
+                color_system=None,
+                width=120,
+            )
+            try:
+                report = doctor_module.DoctorReport()
+                report.run()
+                failures = [
+                    {"problem": problem, "fix": fix}
+                    for problem, fix in getattr(report, "_failures", [])
+                ]
+                return {
+                    "status": "ok",
+                    "output": _redact_log_text(buf.getvalue()),
+                    "failures": _redact_diagnostics_data(failures),
+                }
+            finally:
+                doctor_module.console = previous_console
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": _redact_log_text(str(exc)),
+                "output": _redact_log_text(buf.getvalue()),
+            }
+
+    return await loop.run_in_executor(None, _run)
+
+
+async def _build_routing_status_payload(gateway: Optional[Any], *, live_test: bool = True) -> dict[str, Any]:
+    """Build the /api/routing/status payload without depending on an aiohttp request."""
+    if gateway is None:
+        return {"error": "gateway not ready"}
+
+    cfg = gateway._cfg
+    vault = gateway._vault
+
+    from cato.routing_log import get_routing_log_path
+    from cato.swarmsync import swarmsync_key_status
+
+    key_status = swarmsync_key_status(vault)
+    raw_swarm_key = None
+    if key_status["present"]:
+        from cato.swarmsync import get_swarmsync_api_key
+        raw_swarm_key, _ = get_swarmsync_api_key(vault)
+    openrouter_key = vault.get("OPENROUTER_API_KEY") if vault else None
+
+    status = {
+        "swarmsync_enabled": getattr(cfg, "swarmsync_enabled", False),
+        "swarmsync_api_url": getattr(cfg, "swarmsync_api_url", ""),
+        "default_model": getattr(cfg, "default_model", ""),
+        "swarm_key_present": bool(key_status["present"]),
+        "swarm_key_source": key_status["source"],
+        "swarm_key_prefix": key_status["prefix"],
+        "swarm_key_needs_normalization": key_status["needs_normalization"],
+        "openrouter_key_present": bool(openrouter_key),
+        "will_use_swarmsync": bool(getattr(cfg, "swarmsync_enabled", False) and key_status["present"]),
+        "persistent_routing_log": str(get_routing_log_path()),
+    }
+
+    if not live_test:
+        status["live_test"] = {"skipped": True, "reason": "diagnostics export avoids live network calls"}
+        return status
+
+    if status["will_use_swarmsync"]:
+        try:
+            import aiohttp as _aiohttp
+            payload = {
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+                "swarmsync": {"complexity_score": 0.2, "history_length": 1},
+            }
+            headers = {
+                "Authorization": f"Bearer {raw_swarm_key}",
+                "Content-Type": "application/json",
+            }
+            async with _aiohttp.ClientSession() as s:
+                async with s.post(
+                    status["swarmsync_api_url"],
+                    json=payload,
+                    headers=headers,
+                    timeout=_aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    if r.status in (200, 201):
+                        data = await r.json()
+                        ss = data.get("swarmsync", {})
+                        status["live_test"] = {
+                            "http_status": r.status,
+                            "routed_model": ss.get("routed_model", data.get("model", "")),
+                            "routing_reason": ss.get("routing_reason", ""),
+                            "tier": ss.get("tier", ""),
+                            "complexity_score": ss.get("complexity_score"),
+                        }
+                    else:
+                        body = await r.text()
+                        status["live_test"] = {
+                            "http_status": r.status,
+                            "error": body[:200],
+                            "fix": "Verify SWARMSYNC_API_KEY in the Cato vault and SwarmSync service availability.",
+                        }
+        except Exception as exc:
+            status["live_test"] = {
+                "error": str(exc),
+                "fix": "Check network access, swarmsync_api_url, and the SWARMSYNC_API_KEY vault entry.",
+            }
+
+    return status
+
+
+def _tail_text_file(path: Path, *, max_chars: int = 20_000) -> str:
+    with path.open("rb") as fh:
+        try:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_chars))
+        except OSError:
+            fh.seek(0)
+        data = fh.read(max_chars)
+    return data.decode("utf-8", errors="replace")
+
+
+def _collect_daemon_log_files(*, max_files: int = 8, max_chars: int = 20_000) -> list[dict[str, Any]]:
+    """Collect recent daemon-adjacent log files, tailing and redacting each file."""
+    candidates: list[Path] = []
+    roots = [Path.cwd()]
+    try:
+        from cato.platform import get_data_dir
+        roots.append(get_data_dir() / "logs")
+    except Exception:
+        pass
+
+    for root in roots:
+        if not root.exists():
+            continue
+        if root.is_file() and root.suffix.lower() in {".log", ".txt"}:
+            candidates.append(root)
+            continue
+        patterns = ("*.log", "*stdout*.txt", "*stderr*.txt", "*daemon*.txt")
+        for pattern in patterns:
+            candidates.extend(root.glob(pattern))
+
+    unique = sorted(
+        {p.resolve() for p in candidates if p.is_file()},
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    logs: list[dict[str, Any]] = []
+    for path in unique[:max_files]:
+        try:
+            stat = path.stat()
+            logs.append({
+                "path": str(path),
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                "size_bytes": stat.st_size,
+                "tail": _redact_log_text(_tail_text_file(path, max_chars=max_chars)),
+            })
+        except OSError as exc:
+            logs.append({"path": str(path), "error": _redact_log_text(str(exc))})
+    return logs
 
 
 @web.middleware
@@ -892,10 +1109,14 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         """GET /api/budget/summary — current spend, caps, pct remaining."""
         try:
             if gateway is None:
-                return web.json_response({"session_spend": 0, "session_cap": 3.0,
-                                          "monthly_spend": 0, "monthly_cap": 20.0,
-                                          "session_pct_remaining": 100, "monthly_pct_remaining": 100,
-                                          "monthly_calls": 0, "total_spend_all_time": 0})
+                return web.json_response({
+                    "session_spend": 0, "session_cap": 3.0,
+                    "daily_spend": 0, "daily_cap": 3.0,
+                    "daily_pct_remaining": 100, "daily_calls": 0,
+                    "monthly_spend": 0, "monthly_cap": 20.0,
+                    "session_pct_remaining": 100, "monthly_pct_remaining": 100,
+                    "monthly_calls": 0, "total_spend_all_time": 0,
+                })
             status = gateway._budget.get_status()
             return web.json_response(status)
         except Exception as exc:
@@ -1049,6 +1270,73 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
             logger.error("get_logs error: %s", exc)
             return web.json_response([], status=500)
 
+    async def diagnostics_export(request: web.Request) -> web.Response:
+        """GET /api/diagnostics/export — downloadable JSON diagnostics bundle."""
+        try:
+            raw_limit = request.rel_url.query.get("limit", "100")
+            try:
+                limit = max(1, min(int(raw_limit), 1000))
+            except (TypeError, ValueError):
+                limit = 100
+
+            try:
+                from cato.router import get_routing_history as _get_history
+                routing_events = _get_history()[-limit:]
+            except Exception as exc:
+                routing_events = [{"error": str(exc)}]
+
+            cfg = getattr(gateway, "_cfg", None) if gateway is not None else None
+            if cfg is None:
+                try:
+                    from cato.config import CatoConfig
+                    cfg = CatoConfig.load()
+                except Exception:
+                    cfg = None
+
+            if cfg is not None and hasattr(cfg, "to_dict"):
+                config_metadata = cfg.to_dict()
+            elif cfg is not None:
+                config_metadata = {
+                    k: v for k, v in vars(cfg).items()
+                    if not k.startswith("_")
+                }
+            else:
+                config_metadata = {}
+
+            routing_status_payload, doctor_payload = await asyncio.gather(
+                _build_routing_status_payload(gateway, live_test=False),
+                _collect_doctor_output(),
+            )
+
+            bundle = {
+                "schema_version": 1,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "daemon": {
+                    "uptime_seconds": max(0, round(time.monotonic() - _START_TIME, 3)),
+                    "pid": os.getpid(),
+                },
+                "config": config_metadata,
+                "routing_status": routing_status_payload,
+                "routing_events": routing_events,
+                "doctor": doctor_payload,
+                "logs": {
+                    "buffer": _log_buffer[-limit:],
+                    "files": _collect_daemon_log_files(),
+                },
+            }
+            redacted_bundle = _redact_diagnostics_data(bundle)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            return web.json_response(
+                redacted_bundle,
+                headers={
+                    "Content-Disposition": f'attachment; filename="cato-diagnostics-{timestamp}.json"',
+                    "Cache-Control": "no-store",
+                },
+            )
+        except Exception as exc:
+            logger.error("diagnostics_export error: %s", exc)
+            return web.json_response({"error": _redact_log_text(str(exc))}, status=500)
+
     # ------------------------------------------------------------------ #
     # Audit log                                                            #
     # ------------------------------------------------------------------ #
@@ -1146,17 +1434,32 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         """PATCH /api/config — patch individual config fields and persist to YAML."""
         try:
             import yaml as _yaml
+            from cato.config import CatoConfig
             from cato.platform import get_data_dir as _get_data_dir
             body = await request.json()
+            if not isinstance(body, dict):
+                return web.json_response({"status": "error", "message": "JSON body must be an object"}, status=400)
+            if "strict_approval" in body and not isinstance(body["strict_approval"], bool):
+                return web.json_response({"status": "error", "message": "strict_approval must be a boolean"}, status=400)
+            if "auto_approved_tools" in body:
+                tools = body["auto_approved_tools"]
+                if not isinstance(tools, list) or not all(isinstance(tool, str) for tool in tools):
+                    return web.json_response(
+                        {"status": "error", "message": "auto_approved_tools must be a list of strings"},
+                        status=400,
+                    )
             logger.info("Config patch requested: %s", list(body.keys()))
             # Load current config from YAML file
             config_path = _get_data_dir() / "config.yaml"
-            current: dict = {}
+            current: dict = CatoConfig.load(config_path=config_path).to_dict()
+            current.pop("vault", None)
             if config_path.exists():
                 try:
-                    current = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                    file_values = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                    if isinstance(file_values, dict):
+                        current.update(file_values)
                 except Exception:
-                    current = {}
+                    pass
             # Apply patches
             current.update(body)
             # Persist
@@ -1173,7 +1476,12 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
                 for k, v in body.items():
                     if k in valid_names:
                         setattr(cfg_obj, k, v)
-            return web.json_response({"status": "ok", "config": current})
+            sensitive_substrings = ("token", "password", "secret", "_key", "api_key", "vault")
+            filtered = {
+                k: v for k, v in current.items()
+                if not any(s in k.lower() for s in sensitive_substrings)
+            }
+            return web.json_response({"status": "ok", "config": filtered})
         except Exception as exc:
             logger.error("patch_config error: %s", exc)
             return web.json_response({"status": "error", "message": str(exc)}, status=400)
@@ -1182,14 +1490,18 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         """GET /api/config — return current config read from YAML file."""
         try:
             import yaml as _yaml
+            from cato.config import CatoConfig
             from cato.platform import get_data_dir as _get_data_dir
             config_path = _get_data_dir() / "config.yaml"
-            cfg: dict = {}
+            cfg: dict = CatoConfig.load(config_path=config_path).to_dict()
+            cfg.pop("vault", None)
             if config_path.exists():
                 try:
-                    cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                    file_values = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                    if isinstance(file_values, dict):
+                        cfg.update(file_values)
                 except Exception:
-                    cfg = {}
+                    pass
             # Merge with in-memory config defaults if available
             if gateway is not None and hasattr(gateway, "_cfg"):
                 raw = gateway._cfg
@@ -1199,7 +1511,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
                     merged = {**defaults, **cfg}
                     cfg = merged
             # Filter out sensitive keys before returning
-            _SENSITIVE_SUBSTRINGS = ("token", "password", "secret", "_key", "api_key")
+            _SENSITIVE_SUBSTRINGS = ("token", "password", "secret", "_key", "api_key", "vault")
             filtered = {
                 k: v for k, v in cfg.items()
                 if not any(s in k.lower() for s in _SENSITIVE_SUBSTRINGS)
@@ -1215,80 +1527,10 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
 
     async def routing_status(request: web.Request) -> web.Response:
         """GET /api/routing/status — show SwarmSync config and test a live routing call."""
+        payload = await _build_routing_status_payload(gateway, live_test=True)
         if gateway is None:
-            return web.json_response({"error": "gateway not ready"}, status=503)
-        cfg = gateway._cfg
-        vault = gateway._vault
-
-        from cato.routing_log import get_routing_log_path
-        from cato.swarmsync import swarmsync_key_status
-
-        key_status = swarmsync_key_status(vault)
-        swarm_key = key_status["prefix"]
-        raw_swarm_key = None
-        if key_status["present"]:
-            from cato.swarmsync import get_swarmsync_api_key
-            raw_swarm_key, _ = get_swarmsync_api_key(vault)
-        openrouter_key = vault.get("OPENROUTER_API_KEY") if vault else None
-
-        status = {
-            "swarmsync_enabled": getattr(cfg, "swarmsync_enabled", False),
-            "swarmsync_api_url": getattr(cfg, "swarmsync_api_url", ""),
-            "default_model": getattr(cfg, "default_model", ""),
-            "swarm_key_present": bool(key_status["present"]),
-            "swarm_key_source": key_status["source"],
-            "swarm_key_prefix": swarm_key,
-            "swarm_key_needs_normalization": key_status["needs_normalization"],
-            "openrouter_key_present": bool(openrouter_key),
-            "will_use_swarmsync": bool(getattr(cfg, "swarmsync_enabled", False) and key_status["present"]),
-            "persistent_routing_log": str(get_routing_log_path()),
-        }
-
-        # If SwarmSync is active, do a live test routing call
-        if status["will_use_swarmsync"]:
-            try:
-                import aiohttp as _aiohttp
-                payload = {
-                    "model": "auto",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": False,
-                    "swarmsync": {"complexity_score": 0.2, "history_length": 1},
-                }
-                headers = {
-                    "Authorization": f"Bearer {raw_swarm_key}",
-                    "Content-Type": "application/json",
-                }
-                async with _aiohttp.ClientSession() as s:
-                    async with s.post(
-                        status["swarmsync_api_url"],
-                        json=payload,
-                        headers=headers,
-                        timeout=_aiohttp.ClientTimeout(total=15),
-                    ) as r:
-                        if r.status in (200, 201):
-                            data = await r.json()
-                            ss = data.get("swarmsync", {})
-                            status["live_test"] = {
-                                "http_status": r.status,
-                                "routed_model": ss.get("routed_model", data.get("model", "")),
-                                "routing_reason": ss.get("routing_reason", ""),
-                                "tier": ss.get("tier", ""),
-                                "complexity_score": ss.get("complexity_score"),
-                            }
-                        else:
-                            body = await r.text()
-                            status["live_test"] = {
-                                "http_status": r.status,
-                                "error": body[:200],
-                                "fix": "Verify SWARMSYNC_API_KEY in the Cato vault and SwarmSync service availability.",
-                            }
-            except Exception as exc:
-                status["live_test"] = {
-                    "error": str(exc),
-                    "fix": "Check network access, swarmsync_api_url, and the SWARMSYNC_API_KEY vault entry.",
-                }
-
-        return web.json_response(status)
+            return web.json_response(payload, status=503)
+        return web.json_response(payload)
 
     # ------------------------------------------------------------------ #
     # Cron job history                                                     #
@@ -2382,6 +2624,159 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         return web.FileResponse(_CODING_AGENT)
 
     # ------------------------------------------------------------------ #
+    # Personal inbox                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _find_gmail_adapter() -> Any | None:
+        """Return a live GmailAdapter if one is reachable from the gateway."""
+        if gateway is None:
+            return None
+        for adapter in getattr(gateway, "_adapters", []):
+            if hasattr(adapter, "send_draft"):
+                return adapter
+            nested = getattr(adapter, "_gmail_adapter", None)
+            if nested is not None and hasattr(nested, "send_draft"):
+                return nested
+        return None
+
+    def _read_positive_int(request: web.Request, name: str, default: int, maximum: int) -> int:
+        raw = request.rel_url.query.get(name, "")
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return min(max(value, 1), maximum)
+
+    async def inbox_summary(request: web.Request) -> web.Response:
+        """GET /api/inbox — Gmail draft approvals plus personal notes."""
+        try:
+            from cato.core import personal_store  # noqa: PLC0415
+
+            personal_store.init_db()
+            email_limit = _read_positive_int(request, "email_limit", 25, 100)
+            notes_limit = _read_positive_int(request, "notes_limit", 10, 50)
+            item_limit = _read_positive_int(request, "item_limit", 25, 100)
+            email_drafts = personal_store.get_pending_email_drafts(email_limit)
+            notes = personal_store.get_recent_notes(notes_limit)
+            todos = personal_store.get_open_todos(item_limit)
+            reminders = personal_store.get_open_reminders(item_limit)
+            return web.json_response(
+                {
+                    "email_drafts": email_drafts,
+                    "notes": notes,
+                    "todos": todos,
+                    "reminders": reminders,
+                    "counts": {
+                        "email_drafts": len(email_drafts),
+                        "notes": len(notes),
+                        "todos": len(todos),
+                        "reminders": len(reminders),
+                    },
+                }
+            )
+        except Exception as exc:
+            logger.error("inbox_summary error: %s", exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def inbox_email_approve(request: web.Request) -> web.Response:
+        """POST /api/inbox/email/{row_id}/approve — approve a Gmail draft.
+
+        When a live GmailAdapter is reachable we send the draft immediately.
+        Otherwise the row remains durably ``approved`` so the Gmail flow can
+        pick it up later without losing the user's desktop approval.
+        """
+        try:
+            from cato.core import personal_store  # noqa: PLC0415
+
+            personal_store.init_db()
+            row_id = int(request.match_info["row_id"])
+            claimed = personal_store.claim_email_for_send(row_id)
+            if claimed is None:
+                row = personal_store.get_email_by_id(row_id)
+                if row is None:
+                    return web.json_response({"error": "email_not_found"}, status=404)
+                return web.json_response(
+                    {
+                        "status": row.get("status"),
+                        "sent": row.get("status") == "sent",
+                        "message": "Email draft was already processed.",
+                        "email": row,
+                    },
+                    status=409,
+                )
+
+            row = personal_store.get_email_by_id(row_id)
+            if row is None:
+                return web.json_response({"error": "email_not_found"}, status=404)
+
+            gmail_draft_id = row.get("gmail_draft_id")
+            gmail_adapter = _find_gmail_adapter()
+            if gmail_draft_id and gmail_adapter is not None:
+                await gmail_adapter.send_draft(gmail_draft_id)
+                personal_store.update_email_status(row_id, "sent")
+                row = personal_store.get_email_by_id(row_id)
+                return web.json_response(
+                    {
+                        "status": "sent",
+                        "sent": True,
+                        "message": "Gmail draft sent.",
+                        "email": row,
+                    }
+                )
+
+            return web.json_response(
+                {
+                    "status": "approved",
+                    "sent": False,
+                    "message": (
+                        "Draft approval saved. No live Gmail adapter was available, "
+                        "so sending is deferred to the Gmail flow."
+                    ),
+                    "email": row,
+                }
+            )
+        except ValueError:
+            return web.json_response({"error": "invalid_email_id"}, status=400)
+        except Exception as exc:
+            logger.error("inbox_email_approve error: %s", exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def inbox_email_dismiss(request: web.Request) -> web.Response:
+        """POST /api/inbox/email/{row_id}/dismiss — dismiss a Gmail draft."""
+        try:
+            from cato.core import personal_store  # noqa: PLC0415
+
+            personal_store.init_db()
+            row_id = int(request.match_info["row_id"])
+            changed = personal_store.dismiss_email_draft(row_id)
+            row = personal_store.get_email_by_id(row_id)
+            if row is None:
+                return web.json_response({"error": "email_not_found"}, status=404)
+            if not changed:
+                return web.json_response(
+                    {
+                        "status": row.get("status"),
+                        "message": "Email draft was already processed.",
+                        "email": row,
+                    },
+                    status=409,
+                )
+            return web.json_response(
+                {
+                    "status": "dismissed",
+                    "message": "Email draft dismissed.",
+                    "email": row,
+                }
+            )
+        except ValueError:
+            return web.json_response({"error": "invalid_email_id"}, status=400)
+        except Exception as exc:
+            logger.error("inbox_email_dismiss error: %s", exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+    # ------------------------------------------------------------------ #
     # Router                                                               #
     # ------------------------------------------------------------------ #
 
@@ -2426,6 +2821,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
     app.router.add_get("/api/usage/routing",            get_routing_history)
     # Logs
     app.router.add_get("/api/logs",                      get_logs)
+    app.router.add_get("/api/diagnostics/export",        diagnostics_export)
     # Audit
     app.router.add_get("/api/audit/entries",             get_audit_entries)
     app.router.add_post("/api/audit/verify",             verify_audit_chain)
@@ -2446,6 +2842,10 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
     app.router.add_put("/api/workspace/file",            workspace_put)
     # BUG FIX IDENT-002: POST as alias for PUT on workspace file
     app.router.add_post("/api/workspace/file",           workspace_put)
+    # Personal inbox
+    app.router.add_get("/api/inbox",                      inbox_summary)
+    app.router.add_post("/api/inbox/email/{row_id}/approve", inbox_email_approve)
+    app.router.add_post("/api/inbox/email/{row_id}/dismiss", inbox_email_dismiss)
     # Action Guard
     app.router.add_get("/api/action-guard/status",       action_guard_status)
     # Daemon

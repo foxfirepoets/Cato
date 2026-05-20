@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import '../styles/SettingsView.css'
 
 interface SettingsTab {
-  id: 'general' | 'memory' | 'channels' | 'scheduling' | 'workspace'
+  id: 'general' | 'approval' | 'memory' | 'channels' | 'scheduling' | 'workspace'
   label: string
   icon: string
 }
@@ -53,7 +53,7 @@ interface SettingsViewProps {
 }
 
 export function SettingsView({ httpPort }: SettingsViewProps) {
-  const [activeTab, setActiveTab] = useState<'general' | 'memory' | 'channels' | 'scheduling' | 'workspace'>('general')
+  const [activeTab, setActiveTab] = useState<'general' | 'approval' | 'memory' | 'channels' | 'scheduling' | 'workspace'>('general')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
@@ -65,9 +65,22 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
   const [memoryStats, setMemoryStats] = useState<MemorySettings | null>(null)
   const [workspacePath, setWorkspacePath] = useState('')
   const [defaultModel, setDefaultModel] = useState('')
+  const [strictApproval, setStrictApproval] = useState(false)
+  const [autoApprovedToolsText, setAutoApprovedToolsText] = useState('')
+
+  const alwaysGatedTools = [
+    'shell.exec',
+    'python.execute',
+    'file writes',
+    'GitHub writes',
+    'integration.action',
+    'email send',
+    'payments',
+  ]
 
   const tabs: SettingsTab[] = [
     { id: 'general', label: 'General', icon: '⚙️' },
+    { id: 'approval', label: 'Approval', icon: '✓' },
     { id: 'memory', label: 'Memory', icon: '🧠' },
     { id: 'channels', label: 'Channels', icon: '📱' },
     { id: 'scheduling', label: 'Scheduling', icon: '🕐' },
@@ -86,6 +99,18 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
             const data = await configRes.json()
             setDefaultModel(data.default_model || '')
             setWorkspacePath(data.workspace_dir || '')
+          }
+          break
+        }
+
+        case 'approval': {
+          const configRes = await fetch(`${base}/api/config`)
+          if (configRes.ok) {
+            const data = await configRes.json()
+            setStrictApproval(Boolean(data.strict_approval))
+            setAutoApprovedToolsText(
+              Array.isArray(data.auto_approved_tools) ? data.auto_approved_tools.join('\n') : ''
+            )
           }
           break
         }
@@ -182,6 +207,37 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
     }
   }
 
+  const handleSaveApprovalPolicy = async () => {
+    setLoading(true)
+    setError(null)
+
+    const autoApprovedTools = autoApprovedToolsText
+      .split(/\r?\n/)
+      .map(tool => tool.trim())
+      .filter(Boolean)
+
+    try {
+      const res = await fetch(`${base}/api/config`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          strict_approval: strictApproval,
+          auto_approved_tools: Array.from(new Set(autoApprovedTools)),
+        }),
+      })
+
+      if (res.ok) {
+        setSuccess('Approval policy saved')
+      } else {
+        setError('Failed to save approval policy')
+      }
+    } catch (err) {
+      setError(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <div className="settings-view">
       <div className="settings-header">
@@ -224,6 +280,64 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
               </div>
               <button onClick={handleSaveConfig} className="button-primary">
                 Save Settings
+              </button>
+            </div>
+          )}
+
+          {/* Approval Tab */}
+          {activeTab === 'approval' && (
+            <div className="tab-pane">
+              <h2>Approval Policy</h2>
+              <div className="setting-group approval-toggle-row">
+                <div>
+                  <label>Strict Approval</label>
+                  <p className="hint">
+                    Require approval for every tool call. The whitelist remains saved but is ignored while strict approval is on.
+                  </p>
+                </div>
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={strictApproval}
+                    onChange={e => setStrictApproval(e.target.checked)}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              <div className="setting-group policy-summary">
+                <strong>Effective Policy:</strong>{' '}
+                {strictApproval
+                  ? 'Every tool call asks for approval.'
+                  : 'Listed reversible tools can run without approval; high-risk tools still ask.'}
+              </div>
+
+              <div className="setting-group">
+                <label>Reversible Tool Whitelist</label>
+                <textarea
+                  value={autoApprovedToolsText}
+                  onChange={e => setAutoApprovedToolsText(e.target.value)}
+                  placeholder="memory.search&#10;web.search&#10;read_file"
+                  rows={10}
+                />
+                <p className="hint">
+                  Enter one tool name per line. Use this only for reversible or read-only tools.
+                </p>
+              </div>
+
+              <div className="setting-group">
+                <label>Always Approval-Gated</label>
+                <div className="tool-chip-list">
+                  {alwaysGatedTools.map(tool => (
+                    <span key={tool} className="tool-chip">
+                      {tool}
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              <button onClick={handleSaveApprovalPolicy} className="button-primary">
+                Save Approval Policy
               </button>
             </div>
           )}

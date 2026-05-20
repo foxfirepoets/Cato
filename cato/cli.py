@@ -164,16 +164,20 @@ def cmd_init() -> None:
         monthly_cap = 20.00
     config.monthly_cap = monthly_cap
 
-    # 2. Session cap
-    raw_session = click.prompt(
-        "Session budget cap (USD)",
+    # 2. Daily cap (canonical short-horizon guard; session cap is deprecated)
+    raw_daily = click.prompt(
+        "Daily budget cap (USD)",
         default="3.00",
         show_default=True,
     )
     try:
-        session_cap = float(raw_session.replace("$", "").strip())
+        daily_cap = float(raw_daily.replace("$", "").strip())
     except ValueError:
-        session_cap = 3.00
+        daily_cap = 3.00
+    config.daily_cap = daily_cap
+    # session_cap is retained as an informational field for backward compat,
+    # mirror it to the daily cap so legacy reads land on a sane value.
+    session_cap = daily_cap
     config.session_cap = session_cap
 
     # 3. Vault master password
@@ -235,13 +239,18 @@ def cmd_init() -> None:
     safe_print(f"  Workspace: {config.workspace_dir}")
 
     # 9. Initialise budget manager with chosen caps
-    bm = BudgetManager(session_cap=session_cap, monthly_cap=monthly_cap)
+    bm = BudgetManager(
+        session_cap=session_cap,
+        monthly_cap=monthly_cap,
+        daily_cap=daily_cap,
+    )
     bm.set_monthly_cap(monthly_cap)
+    bm.set_daily_cap(daily_cap)
     bm.set_session_cap(session_cap)
 
     safe_print(
         f"\nCato initialised.  "
-        f"Monthly cap: ${monthly_cap:.2f}  |  Session cap: ${session_cap:.2f}"
+        f"Daily cap: ${daily_cap:.2f}  |  Monthly cap: ${monthly_cap:.2f}"
     )
     safe_print("Run [cato start] to begin.\n")
 
@@ -500,6 +509,7 @@ def _run_daemon(config: CatoConfig, agent: str, channel: str) -> None:
     budget = BudgetManager(
         session_cap=config.session_cap,
         monthly_cap=config.monthly_cap,
+        daily_cap=config.daily_cap,
     )
 
     async def _main(cfg: CatoConfig, vlt: "Vault", bdg: BudgetManager) -> None:
@@ -764,9 +774,11 @@ def cmd_status() -> None:
         bm = BudgetManager(
             session_cap=config.session_cap,
             monthly_cap=config.monthly_cap,
+            daily_cap=config.daily_cap,
         )
         status = bm.get_status()
         safe_print(f"  {bm.format_footer()}")
+        safe_print(f"  Calls today:      {status['daily_calls']}")
         safe_print(f"  Calls this month: {status['monthly_calls']}")
     except Exception as exc:
         safe_print(f"  Could not load budget: {exc}")
@@ -1025,7 +1037,11 @@ def _run_cron_in_process(entry: dict, agent: str) -> None:
     cfg = _Cfg.load()
     vault_path = _CATO_DIR / "vault.enc"
     vault = _Vault(vault_path=vault_path) if vault_path.exists() else None
-    budget = _BM(session_cap=cfg.session_cap, monthly_cap=cfg.monthly_cap)
+    budget = _BM(
+        session_cap=cfg.session_cap,
+        monthly_cap=cfg.monthly_cap,
+        daily_cap=cfg.daily_cap,
+    )
     memory = MemorySystem(agent_id=agent)
     ctx = ContextBuilder(max_tokens=cfg.context_budget_tokens)
     loop = AgentLoop(config=cfg, budget=budget, vault=vault, memory=memory, context_builder=ctx)
