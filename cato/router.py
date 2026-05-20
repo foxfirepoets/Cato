@@ -114,11 +114,11 @@ def classify_api_error(exc: Exception) -> ClassifiedError:
 
 # Fallback chain: if primary model fails, try these in order
 _FALLBACK_CHAIN: list[str] = [
-    "claude-sonnet-4-6",
-    "gpt-4o",
-    "gemini-2.0-flash",
-    "deepseek-chat",
-    "llama-3.3-70b-versatile",
+    "openrouter/anthropic/claude-sonnet-4-6",
+    "openrouter/openai/gpt-4o",
+    "openrouter/google/gemini-flash-1.5",
+    "openrouter/deepseek/deepseek-chat",
+    "openrouter/meta-llama/llama-3.3-70b-instruct",
 ]
 
 logger = logging.getLogger(__name__)
@@ -167,9 +167,12 @@ MODEL_TRANSLATIONS: dict[str, str] = {
     "moonshot/kimi-k2.5":            "moonshot-v1-8k",
 }
 
-_ECONOMY = ["claude-haiku-4-5-20251001", "gemini-2.0-flash-lite", "llama-3.3-70b-versatile"]
-_MID     = ["claude-sonnet-4-6", "gemini-2.0-flash", "gpt-4o-mini", "deepseek-chat"]
-_PREMIUM = ["claude-opus-4-6", "gemini-2.0-pro-exp", "gpt-4o", "deepseek-reasoner"]
+# All fallback pools use OpenRouter so Cato never needs direct provider keys.
+# SwarmSync handles primary routing — these are only used when SwarmSync is
+# unreachable AND the OPENROUTER_API_KEY is present.
+_ECONOMY = ["openrouter/meta-llama/llama-3.3-70b-instruct", "openrouter/google/gemini-flash-1.5-8b"]
+_MID     = ["openrouter/anthropic/claude-sonnet-4-6", "openrouter/google/gemini-flash-1.5", "openrouter/openai/gpt-4o-mini"]
+_PREMIUM = ["openrouter/anthropic/claude-opus-4-6", "openrouter/openai/gpt-4o", "openrouter/deepseek/deepseek-chat"]
 
 # (prefix, base_url, auth_scheme)
 _PROVIDERS: list[tuple[str, str, str]] = [
@@ -300,7 +303,7 @@ class ModelRouter:
     def __init__(
         self,
         vault: Any,
-        preferred_model: str = "claude-sonnet-4-6",
+        preferred_model: str = "openrouter/minimax/minimax-m2.5",
         blocked_models: Optional[list[str]] = None,
         swarmsync_api_url: str = "https://api.swarmsync.ai/v1/chat/completions",
         max_output_tokens: int = 16384,
@@ -375,7 +378,10 @@ class ModelRouter:
         for m in _ECONOMY + _MID + _PREMIUM:
             if self._is_available(m):
                 return m
-        return _ECONOMY[0]  # last-resort: cheapest available model
+        # Last resort: fall back to whichever pool model is cheapest, or the
+        # OpenRouter default if even that has no key.  Never return a bare
+        # claude-*/gpt-* slug — those need direct provider keys Cato doesn't have.
+        return _ECONOMY[0]  # _ECONOMY[0] is now an openrouter/ slug
 
     async def _swarmsync_route(
         self, messages: list[dict], api_key: str, score: float

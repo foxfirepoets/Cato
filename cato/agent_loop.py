@@ -1596,6 +1596,7 @@ class AgentLoop:
                 text = ""
                 tool_calls: list[ToolCall] = []
                 used_swarmsync = False
+                routed_model_name = model  # updated if SwarmSync succeeds
 
                 # Progress: llm_start (emitted around the actual LLM call,
                 # whether routed via SwarmSync or the local stream_collect
@@ -1639,14 +1640,19 @@ class AgentLoop:
                                 )
                             if not isinstance(swarm_response, dict):
                                 swarm_response = {"role": "assistant", "content": swarm_response or ""}
-                            model = routed_model
+                            # Track routed model for logging/cost accounting but do NOT overwrite
+                            # `model` — if SwarmSync fails on a later turn the fallback path must
+                            # use a model we can actually call (default_model → OpenRouter via
+                            # SwarmSync).  Overwriting `model` with "anthropic/claude-opus-4-7"
+                            # causes a 400 because Cato has no direct Anthropic API key.
+                            routed_model_name = routed_model
                             logger.info(
                                 "SwarmSync turn=%d keys=%s has_tool_calls=%s content_len=%d model=%s",
                                 planning_turns,
                                 list(swarm_response.keys()),
                                 "tool_calls" in swarm_response,
                                 len(swarm_response.get("content", "") or ""),
-                                model,
+                                routed_model_name,
                             )
                             text = swarm_response.get("content", "") or ""
                             tool_calls = _parse_tool_calls_openai(swarm_response)
