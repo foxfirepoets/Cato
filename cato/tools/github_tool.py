@@ -116,13 +116,30 @@ class GitHubTool:
     def _gh_env(self) -> dict[str, str]:
         """Return environment dict with GH_TOKEN injected if available."""
         env = dict(os.environ)
-        if self._vault is not None:
+
+        # Resolve token: check env vars first, then vault, in priority order.
+        # Legacy alias: some installs stored the token under the account-specific
+        # name GITHUB_FOXFIREPOETS_TOKEN.  Check it as a fallback.
+        token = (
+            os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GH_TOKEN")
+            or os.environ.get("github_token")
+            or os.environ.get("GITHUB_FOXFIREPOETS_TOKEN")  # legacy account-specific name
+        )
+
+        if not token and self._vault is not None:
             try:
-                token = self._vault.get("github_token")
-                if token:
-                    env["GH_TOKEN"] = token
+                token = (
+                    self._vault.get("GITHUB_TOKEN")
+                    or self._vault.get("GH_TOKEN")
+                    or self._vault.get("github_token")
+                    or self._vault.get("GITHUB_FOXFIREPOETS_TOKEN")  # legacy vault key
+                )
             except Exception:
                 pass
+
+        if token:
+            env["GH_TOKEN"] = token
         return env
 
     async def _run_gh(self, args: list[str], timeout_sec: float = 30.0) -> str:

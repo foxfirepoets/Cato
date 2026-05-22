@@ -41,6 +41,7 @@ Mounts:
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import io
 import json
@@ -121,6 +122,32 @@ _SECRET_PATTERNS = [
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\b\d{8,12}:[A-Za-z0-9_\-]{30,}\b"),
 ]
+
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter for dangerous mutation endpoints
+# ---------------------------------------------------------------------------
+_RATE_LIMIT_WINDOWS: dict[str, collections.deque] = collections.defaultdict(collections.deque)
+_RATE_LIMIT_RULES: dict[str, tuple[int, int]] = {
+    "/api/daemon/restart": (3, 60),    # max 3 per 60 seconds
+    "/api/vault/set":      (10, 60),   # max 10 per 60 seconds
+    "/api/vault/delete":   (10, 60),   # max 10 per 60 seconds
+}
+
+
+def _check_rate_limit(path: str, client_ip: str = "local") -> bool:
+    """Returns True if the request is allowed, False if rate limit exceeded."""
+    if path not in _RATE_LIMIT_RULES:
+        return True
+    max_reqs, window_secs = _RATE_LIMIT_RULES[path]
+    key = f"{path}:{client_ip}"
+    now = time.monotonic()
+    dq = _RATE_LIMIT_WINDOWS[key]
+    while dq and now - dq[0] > window_secs:
+        dq.popleft()
+    if len(dq) >= max_reqs:
+        return False
+    dq.append(now)
+    return True
 
 
 def _redact_log_text(text: str) -> str:
@@ -501,7 +528,7 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         html = _DASHBOARD.read_text(encoding="utf-8")
         injection = (
             "<script>\n"
-            f"window.__CATO_TOKEN__ = {repr(_DAEMON_TOKEN)};\n"
+            f"window.__CATO_TOKEN__ = {json.dumps(_DAEMON_TOKEN)};\n"
             "const __catoFetch = window.fetch.bind(window);\n"
             "window.fetch = (input, init = {}) => {\n"
             "  const headers = new Headers(init.headers || {});\n"
@@ -648,6 +675,8 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
 
     async def vault_set_key(request: web.Request) -> web.Response:
         """POST /api/vault/set — store a key in the vault. Body: {key, value}."""
+        if not _check_rate_limit(request.path, request.remote or "local"):
+            return web.json_response({"error": "Rate limit exceeded"}, status=429)
         try:
             body = await request.json()
             k = str(body.get("key", "")).strip()
@@ -665,6 +694,8 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
 
     async def vault_delete_key(request: web.Request) -> web.Response:
         """DELETE /api/vault/delete — remove a key from the vault. Body: {key}."""
+        if not _check_rate_limit(request.path, request.remote or "local"):
+            return web.json_response({"error": "Rate limit exceeded"}, status=429)
         try:
             body = await request.json()
             k = str(body.get("key", "")).strip()
@@ -807,6 +838,8 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
 
     async def kill_session(request: web.Request) -> web.Response:
         """DELETE /api/sessions/{session_id} — stop a session lane."""
+        # SINGLE-USER: No ownership check — all sessions belong to the authenticated user.
+        # TODO: Add ownership check when multi-user support is added.
         session_id = request.match_info.get("session_id", "")
         try:
             if gateway is None:
@@ -1039,6 +1072,14 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         try:
             from cato.core.schedule_manager import Schedule
             body = await request.json()
+            skill = str(body.get("skill", "")).strip()
+            if not skill:
+                return web.json_response({"status": "error", "message": "skill field is required"}, status=400)
+            if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', skill):
+                return web.json_response(
+                    {"status": "error", "message": "skill must be alphanumeric/underscore/hyphen, max 64 chars"},
+                    status=400,
+                )
             sched = Schedule.from_dict(body)
             sched.save()
             return web.json_response({"status": "ok", "name": sched.name})
@@ -1741,6 +1782,8 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
 
     async def daemon_restart(request: web.Request) -> web.Response:
         """POST /api/daemon/restart — signal daemon to restart (best-effort)."""
+        if not _check_rate_limit(request.path, request.remote or "local"):
+            return web.json_response({"error": "Rate limit exceeded"}, status=429)
         try:
             logger.info("Daemon restart requested via API")
             import asyncio as _asyncio
@@ -1777,6 +1820,8 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
             import asyncio as _asyncio
             from cato.memory.contradiction_detector import ContradictionDetector
             from cato.platform import get_data_dir
+            # NOTE: Intentionally overrides module default path to use get_data_dir()/default/.
+            # See contradiction_detector.py for default. Modules should adopt this path (H-9 fix).
             db_path = get_data_dir() / "default" / "contradictions.db"
             detector = ContradictionDetector(db_path=str(db_path))
             def _fetch():
@@ -1800,6 +1845,8 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
             import asyncio as _asyncio
             from cato.memory.decision_memory import DecisionMemory
             from cato.platform import get_data_dir
+            # NOTE: Intentionally overrides module default path to use get_data_dir()/default/.
+            # See decision_memory.py for default. Modules should adopt this path (H-9 fix).
             db_path = get_data_dir() / "default" / "decisions.db"
             dm = DecisionMemory(db_path=db_path)
             def _fetch():
@@ -1832,6 +1879,8 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
             import asyncio as _asyncio
             from cato.monitoring.anomaly_detector import AnomalyDetector
             from cato.platform import get_data_dir
+            # NOTE: Intentionally overrides module default path to use get_data_dir()/default/.
+            # See anomaly_detector.py for default. Modules should adopt this path (H-9 fix).
             db_path = get_data_dir() / "default" / "anomaly.db"
             detector = AnomalyDetector(db_path=db_path)
             def _fetch():
@@ -1912,15 +1961,35 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
         """POST /api/tokens — create a new delegation token."""
         try:
             import asyncio as _asyncio
-            from cato.auth.token_store import TokenStore
+            from cato.auth.token_store import ACTION_CATEGORIES, TokenStore
             from cato.platform import get_data_dir
             body = await request.json()
+            categories = body.get("categories", [])
+            if not isinstance(categories, list):
+                return web.json_response(
+                    {"status": "error", "message": "categories must be a list"},
+                    status=400,
+                )
+            # Validate each category against the known taxonomy; "*" is a wildcard sentinel
+            valid_categories = set(ACTION_CATEGORIES) | {"*"}
+            invalid_cats = set(categories) - valid_categories
+            if invalid_cats:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": (
+                            f"Invalid categories: {sorted(invalid_cats)}. "
+                            f"Valid: {sorted(valid_categories)}"
+                        ),
+                    },
+                    status=400,
+                )
             db_path = get_data_dir() / "default" / "tokens.db"
             ts = TokenStore(db_path=db_path)
             def _create():
                 try:
                     token = ts.create(
-                        allowed_action_categories=body.get("categories", []),
+                        allowed_action_categories=categories,
                         spending_ceiling=body.get("spending_ceiling", 1.0),
                         expires_in_seconds=body.get("expires_in_seconds", 3600),
                     )
@@ -2272,6 +2341,8 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
 
     async def replay_session(request: web.Request) -> web.Response:
         """POST /api/sessions/{session_id}/replay — dry-run replay of a session."""
+        # SINGLE-USER: No ownership check — all sessions belong to the authenticated user.
+        # TODO: Add ownership check when multi-user support is added.
         session_id = request.match_info.get("session_id", "")
         try:
             import asyncio as _asyncio
@@ -2835,7 +2906,9 @@ async def create_ui_app(gateway: Optional[Any] = None) -> web.Application:
     app.router.add_get("/api/memory/files",              memory_files)
     app.router.add_get("/api/memory/content",            memory_content)
     app.router.add_route("PATCH", "/api/memory/content", patch_memory_content)
-    app.router.add_get("/api/memory/stats",              memory_stats)
+    # NOTE: /api/memory/stats is registered by memory_routes.py via register_all_routes()
+    # below (line ~2899). The richer handler (facts/kg_nodes/kg_edges/stats) lives in
+    # memory_routes.py. Do NOT add a duplicate registration here.
     # Workspace identity files
     app.router.add_get("/api/workspace/files",           workspace_list)
     app.router.add_get("/api/workspace/file",            workspace_get)

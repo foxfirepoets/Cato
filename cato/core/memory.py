@@ -143,9 +143,14 @@ def _apply_facts_migration(conn: sqlite3.Connection) -> None:
         try:
             conn.execute(f"ALTER TABLE facts ADD COLUMN {col_name} {col_def}")
             conn.commit()
-        except sqlite3.OperationalError:
-            # Column already exists — idempotent
-            pass
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "duplicate column name" in msg or "already exists" in msg:
+                # Column already exists — idempotent, safe to continue
+                pass
+            else:
+                # Real error (disk full, locked, corrupt) — re-raise
+                raise
 
     # Track migration
     already = conn.execute(
@@ -270,6 +275,7 @@ class MemorySystem:
         conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(_SCHEMA)
         conn.commit()
         _apply_facts_migration(conn)

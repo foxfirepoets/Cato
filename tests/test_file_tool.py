@@ -36,3 +36,25 @@ async def test_valid_read_write(tmp_path, monkeypatch):
     written_file = tmp_path / "test" / "test.txt"
     assert written_file.exists(), f"expected file at {written_file}"
     assert written_file.read_text(encoding="utf-8") == "hello"
+
+
+@pytest.mark.asyncio
+async def test_path_traversal_dotdot_blocked(tmp_path, monkeypatch):
+    """../../etc/passwd style paths must be rejected by the file tool."""
+    monkeypatch.setenv("CATO_WORKSPACE_DIR", str(tmp_path))
+    tool = FileTool()
+    raw = await tool.execute({"action": "read", "path": "../../etc/passwd", "agent_id": "test"})
+    result = json.loads(raw)
+    assert result.get("success") is False
+    assert "traversal" in (result.get("error") or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_path_traversal_windows_blocked(tmp_path, monkeypatch):
+    """..\\..\\Windows\\System32 style paths must be rejected on all platforms."""
+    monkeypatch.setenv("CATO_WORKSPACE_DIR", str(tmp_path))
+    tool = FileTool()
+    raw = await tool.execute({"action": "read", "path": "..\\..\\Windows\\System32", "agent_id": "test"})
+    result = json.loads(raw)
+    assert result.get("success") is False
+    assert "traversal" in (result.get("error") or "").lower()

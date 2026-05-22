@@ -48,7 +48,7 @@ _RATE_LIMIT_SLEEP = 1.1   # seconds between Telegram notifications
 # _NO_REPLY_SENDER_SUBSTRINGS: match anywhere in the full address (safe for long unique patterns).
 
 _NO_REPLY_EXACT_LOCAL: frozenset[str] = frozenset({
-    # Role addresses where the EXACT local part means automated/no-reply
+    # Unambiguously automated local parts — never a real person's address
     "noreply",
     "no-reply",
     "no_reply",
@@ -61,23 +61,8 @@ _NO_REPLY_EXACT_LOCAL: frozenset[str] = frozenset({
     "bounces",
     "automated",
     "auto-confirm",
-    "newsletter",
-    "notifications",
-    "notify",
-    "news",
-    "updates",
-    "alerts",
-    "info",
-    "support",
-    "help",
-    "billing",
-    "receipts",
-    "invoice",
-    "statements",
-    "security",
-    "accounts",
-    "account",
-    "reply",
+    "auto-reply",
+    "auto_reply",
 })
 
 # Substring patterns — safe to match anywhere (domain-level or unique prefixes)
@@ -241,6 +226,7 @@ class GmailAdapter:
     def __init__(self, vault: "Vault") -> None:
         self._vault = vault
         self._running = False
+        self._enabled = True  # set to False when required credentials are missing
         self._task: asyncio.Task | None = None
         self._check_in_progress = False
 
@@ -268,7 +254,7 @@ class GmailAdapter:
 
         self._running = True
         logger.info("GmailAdapter started (poll interval: %ds)", _POLL_INTERVAL)
-        while self._running:
+        while self._running and self._enabled:
             try:
                 await self.check_once()
             except asyncio.CancelledError:
@@ -469,10 +455,17 @@ class GmailAdapter:
         loop = asyncio.get_event_loop()
 
         # Validate credentials before hitting the API
-        refresh_token = self._vault.get("GMAIL_REFRESH_TOKEN") or ""
+        refresh_token = (
+            self._vault.get("GMAIL_REFRESH_TOKEN")
+            or os.environ.get("GMAIL_REFRESH_TOKEN", "")
+        )
         if not refresh_token:
-            logger.warning("GMAIL_REFRESH_TOKEN not set in vault — skipping email check")
-            return
+            logger.error(
+                "[GmailAdapter] GMAIL_REFRESH_TOKEN not found in vault or environment. "
+                "Gmail integration is disabled. Run 'cato init' to configure Gmail."
+            )
+            self._enabled = False
+            return  # Do not proceed with polling
 
         # Build service once for the entire check cycle
         try:

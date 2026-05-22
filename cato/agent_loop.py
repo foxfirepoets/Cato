@@ -1311,6 +1311,29 @@ def _tool_result_message(call: ToolCall, result: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# LLM configuration check
+# ---------------------------------------------------------------------------
+
+def _check_llm_config(cfg: Any, vault: Any) -> bool:
+    """Warn at startup if SwarmSync is enabled but no API key is configured.
+
+    Returns True when the LLM is ready to accept calls, False otherwise.
+    Called synchronously from AgentLoop.__init__ so the warning appears in
+    the daemon log the moment the loop is constructed — before any user
+    message arrives.
+    """
+    if getattr(cfg, "swarmsync_enabled", False):
+        key, _ = get_swarmsync_api_key(vault)
+        if not key:
+            logger.warning(
+                "[AgentLoop] WARNING: swarmsync_enabled=True but SWARMSYNC_API_KEY "
+                "is not configured. LLM calls will fail. Run 'cato init' to configure."
+            )
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # AgentLoop
 # ---------------------------------------------------------------------------
 
@@ -1411,6 +1434,11 @@ class AgentLoop:
         # Register Knowledge Graph tool actions (Skill 9)
         _register_graph_tools(memory=memory)
 
+        # Startup LLM config check — warn early if SwarmSync is enabled but no
+        # API key is present so the user knows immediately rather than sending
+        # a message and getting no response.
+        self._llm_ready = _check_llm_config(config, vault)
+
     def register_tool(self, name: str, fn: Callable) -> None:
         """Register a tool with the global registry."""
         register_tool(name, fn)
@@ -1506,6 +1534,26 @@ class AgentLoop:
         if not swarm_key:
             logger.warning("SWARMSYNC_API_KEY not found in vault — SwarmSync routing disabled, using degraded fallback model")
         use_swarmsync = self._cfg.swarmsync_enabled and bool(swarm_key)
+
+        # Return a user-visible error immediately when SwarmSync is required
+        # but no API key is available — prevents silent failures where the user
+        # sends a message and receives no response at all.
+        if self._cfg.swarmsync_enabled and not swarm_key:
+            _no_key_msg = (
+                "No LLM API key configured. Cato cannot route this message.\n\n"
+                "Fix: Run `cato init` to set your SwarmSync or OpenRouter API key, "
+                "or set SWARMSYNC_API_KEY in your environment."
+            )
+            logger.warning("[AgentLoop] swarmsync_enabled=True but no key — returning config error to user")
+            await _aappend(tpath, {
+                "ts": _now(), "role": "user",
+                "content": message, "session_id": session_id,
+            })
+            await _aappend(tpath, {
+                "ts": _now(), "role": "assistant",
+                "content": _no_key_msg, "session_id": session_id,
+            })
+            return _no_key_msg, "", self._cfg.default_model
         # Sanitize tool names for OpenAI API compatibility (no dots allowed)
         _tools_for_swarm: list[dict] = []
         _swarm_name_map: dict[str, str] = {}  # sanitized → original

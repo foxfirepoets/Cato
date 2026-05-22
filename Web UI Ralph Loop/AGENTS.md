@@ -2,7 +2,7 @@
 
 ## Build & Run
 - Backend tests: `cd C:/Users/Administrator/Desktop/Cato && python -m pytest tests/ -x --tb=short`
-- Daemon: `cd C:/Users/Administrator/Desktop/Cato && CATO_VAULT_PASSWORD=mypassword123 python cato_svc_runner.py`
+- Daemon: `cd C:/Users/Administrator/Desktop/Cato && CATO_VAULT_PASSWORD=<your-vault-password> python cato_svc_runner.py`
 - Web UI: `http://127.0.0.1:8080/` (served by aiohttp daemon)
 
 ## Validation Commands

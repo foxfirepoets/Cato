@@ -20,8 +20,8 @@ PYTHON_EXE     = r"C:\Python313\python.exe"
 LOG_FILE       = r"C:\Users\Administrator\Desktop\Cato\logs\telegram_bridge.log"
 REG_RUN_KEY    = r"Software\Microsoft\Windows\CurrentVersion\Run"
 TASK_NAME      = "CatoTelegramBridge"
-BOT_TOKEN      = "8573304576:AAFT4SbfetSd2ydONWYE75atJC-CHmjLu9U"
-VAULT_PASSWORD = "mypassword123"
+BOT_TOKEN      = os.environ.get("CATODESKTOP_BOT_TOKEN", "")
+VAULT_PASSWORD = os.environ.get("CATO_VAULT_PASSWORD", "")
 # Wraps in cmd /c with env vars set inline, stdout+stderr redirected to log
 CMD = (
     f'cmd.exe /c "set TELEGRAM_BOT_TOKEN={BOT_TOKEN}'
@@ -31,6 +31,14 @@ CMD = (
 
 
 def install():
+    if not BOT_TOKEN:
+        print("[autostart] ERROR: CATODESKTOP_BOT_TOKEN environment variable is not set.")
+        print("[autostart] Set it before running: set CATODESKTOP_BOT_TOKEN=<your-bot-token>")
+        sys.exit(1)
+    if not VAULT_PASSWORD:
+        print("[autostart] ERROR: CATO_VAULT_PASSWORD environment variable is not set.")
+        print("[autostart] Set it before running: set CATO_VAULT_PASSWORD=<your-strong-password>")
+        sys.exit(1)
     # Ensure log dir exists
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 

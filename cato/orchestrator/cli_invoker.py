@@ -401,6 +401,10 @@ async def invoke_all_parallel(
     results before returning; for mid-flight cancellation driven by an early
     confidence threshold, use ``invoke_with_early_termination`` instead.
 
+    On Windows, Gemini is skipped (known stdin pipe detection hang) and a
+    degraded stub is returned in its place so callers see a consistent
+    three-element tuple.
+
     Args:
         prompt: Context or code to analyse.
         task: High-level task description.
@@ -410,10 +414,27 @@ async def invoke_all_parallel(
     """
     claude_task = asyncio.create_task(invoke_claude_api(prompt, task))
     codex_task = asyncio.create_task(invoke_codex_cli(prompt, task))
-    gemini_task = asyncio.create_task(invoke_gemini_cli(prompt, task))
 
-    results = await asyncio.gather(claude_task, codex_task, gemini_task)
-    return tuple(results)
+    # Gemini hangs on Windows due to stdin pipe detection issue — skip it.
+    if sys.platform != "win32":
+        gemini_task = asyncio.create_task(invoke_gemini_cli(prompt, task))
+        claude_result, codex_result, gemini_result = await asyncio.gather(
+            claude_task, codex_task, gemini_task
+        )
+    else:
+        logger.info("[CodingAgent] Skipping Gemini on Windows (known stdin hang issue)")
+        gemini_stub: Dict = {
+            "model": "gemini",
+            "response": "[Gemini] Skipped on Windows (stdin pipe detection issue)",
+            "confidence": 0.0,
+            "latency_ms": 0.0,
+            "degraded": True,
+            "source": "skipped",
+        }
+        claude_result, codex_result = await asyncio.gather(claude_task, codex_task)
+        gemini_result = gemini_stub
+
+    return (claude_result, codex_result, gemini_result)
 
 
 async def invoke_with_early_termination(
@@ -452,8 +473,24 @@ async def invoke_with_early_termination(
     model_tasks = [
         asyncio.create_task(_invoke_and_enqueue(invoke_claude_api(prompt, task))),
         asyncio.create_task(_invoke_and_enqueue(invoke_codex_cli(prompt, task))),
-        asyncio.create_task(_invoke_and_enqueue(invoke_gemini_cli(prompt, task))),
     ]
+    if sys.platform != "win32":
+        model_tasks.append(
+            asyncio.create_task(_invoke_and_enqueue(invoke_gemini_cli(prompt, task)))
+        )
+    else:
+        logger.info("[CodingAgent] Skipping Gemini on Windows (known stdin hang issue)")
+        # Immediately enqueue a degraded stub so consumers get the expected result count
+        asyncio.get_event_loop().call_soon(
+            lambda: results_queue.put_nowait({
+                "model": "gemini",
+                "response": "[Gemini] Skipped on Windows (stdin pipe detection issue)",
+                "confidence": 0.0,
+                "latency_ms": 0.0,
+                "degraded": True,
+                "source": "skipped",
+            })
+        )
 
     if cancel_event is not None:
         # Race: finish all models OR cancel_event fires

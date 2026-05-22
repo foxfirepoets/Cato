@@ -930,12 +930,20 @@ class ModelRouter:
         return "https://api.openai.com/v1/chat/completions", "bearer"
 
     def _is_available(self, model: str) -> bool:
+        if model in self._blocked:
+            return False
+        # openrouter/-prefixed models are accessed via OPENROUTER_API_KEY.
+        # Do NOT translate through MODEL_TRANSLATIONS here — the table maps
+        # them to native IDs that require a separate provider key, which would
+        # give a false negative when only OPENROUTER_API_KEY is present.
+        if model.startswith("openrouter/"):
+            _, auth = self._resolve_provider(model)
+            return bool(self._get_api_key(auth, model))
         resolved = MODEL_TRANSLATIONS.get(model, model)
-        if resolved in self._blocked or model in self._blocked:
+        if resolved in self._blocked:
             return False
         _, auth = self._resolve_provider(resolved)
-        api_key = self._get_api_key(auth, resolved)
-        return bool(api_key)
+        return bool(self._get_api_key(auth, resolved))
 
     def _get_api_key(self, auth: str, model: str) -> str:
         import os as _os

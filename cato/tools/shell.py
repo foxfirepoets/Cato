@@ -81,12 +81,21 @@ class ShellTool:
         timeout = min(int(args.get("timeout", 30)), _MAX_TIMEOUT)
         cwd = args.get("cwd") or str(_default_workspace())
 
-        # Auto-upgrade to full mode for PowerShell commands so they can run
-        # anywhere on the system with unrestricted access.
-        first_word = shlex.split(command)[0].lower() if command.strip() else ""
+        # Auto-upgrade to full mode for PowerShell commands only when the
+        # operator has explicitly opted in via powershell_full_mode=true.
+        try:
+            first_word = shlex.split(command)[0].lower() if command.strip() else ""
+        except ValueError:
+            first_word = command.strip().split()[0].lower() if command.strip() else ""
         base_cmd = Path(first_word).name
         if base_cmd in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
-            mode = "full"
+            from ..config import CatoConfig
+            cfg = CatoConfig.load()
+            if getattr(cfg, "powershell_full_mode", False):
+                mode = "full"
+            else:
+                # Restricted: honour caller-supplied mode or fall back to gateway
+                mode = args.get("mode", "gateway")
         else:
             mode = args.get("mode", "gateway")
 

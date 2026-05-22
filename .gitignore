@@ -99,6 +99,7 @@ Ralph Loop Web UI/
 # --- Added: keep-out categories from untracked audit ---
 
 # Local logs and test outputs (root-level scratch)
+/pytest_*.txt
 /build_log*.txt
 /cargo_log.txt
 /daemon_err.txt
@@ -133,7 +134,9 @@ Ralph Loop Web UI/
 /IDENTITY.md
 /SOUL.md
 HKO_CERTIFICATE_*.md
-HKO_TRUTH_AUDIT_*.md
+HKO_TRUTH_AUDIT*.md
+HKO-truth-audit-report.md
+HKO-certificate.md
 TRUTH_AUDIT_*.md
 
 # Brainstorm and strategy folders
@@ -148,6 +151,7 @@ workspace_files/
 
 # Machine-specific launchers
 /Launch-CatoDesktop.ps1
+install_autostart.py
 
 # Audit reports (judgment-call group)
 final-outcome-audit-reports/

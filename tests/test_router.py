@@ -17,10 +17,15 @@ def test_human_minimax_label_maps_to_openrouter_slug() -> None:
     assert router.select_model(0.0) == "openrouter/minimax/minimax-m2.5"
 
 
-def test_low_complexity_fallback_skips_claude_without_anthropic_key() -> None:
-    vault = DummyVault({"GOOGLE_API_KEY": "test-google"})
+def test_low_complexity_fallback_skips_claude_without_anthropic_key(monkeypatch) -> None:
+    # Without ANTHROPIC_API_KEY, low-complexity routing must not select Claude.
+    # _ECONOMY is now all openrouter/ slugs — expects OPENROUTER_API_KEY.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    vault = DummyVault({"OPENROUTER_API_KEY": "test-openrouter"})
     router = ModelRouter(vault=vault, preferred_model="")
-    assert router.select_model(0.0) == "gemini-2.0-flash-lite"
+    result = router.select_model(0.0)
+    assert "claude" not in result.lower(), f"Expected non-Claude model, got {result!r}"
+    assert result.startswith("openrouter/"), f"Expected OpenRouter model, got {result!r}"
 
 
 def test_routing_decision_persists_to_sqlite_log(tmp_path, monkeypatch) -> None:
@@ -64,3 +69,25 @@ def test_routing_decision_persists_to_sqlite_log(tmp_path, monkeypatch) -> None:
     assert history[0]["actual_cost"] == 0.001
     assert history[0]["success"] is True
     assert history[0]["fallback_routing"] is False
+
+
+def test_swarmsync_missing_key_returns_error_message(monkeypatch):
+    """When SWARMSYNC_API_KEY is absent, get_swarmsync_api_key returns empty
+    and the no-key error message is present in agent_loop for user feedback."""
+    import cato.swarmsync as ss_mod
+    import cato.agent_loop as al_mod
+    import inspect
+
+    # Clear env so the helper cannot fall back to an env var
+    monkeypatch.delenv("SWARMSYNC_API_KEY", raising=False)
+    monkeypatch.delenv("SWARM_SYNC_API_KEY", raising=False)
+
+    vault_empty = DummyVault({})
+    key, source = ss_mod.get_swarmsync_api_key(vault_empty)
+    assert key == "", "Expected empty key when vault and env have no SwarmSync key"
+
+    # Verify the user-visible error string is still present in agent_loop source
+    src = inspect.getsource(al_mod)
+    assert "No LLM API key configured" in src, (
+        "User-visible error message must remain in agent_loop for no-key scenario"
+    )

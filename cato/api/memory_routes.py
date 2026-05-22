@@ -111,20 +111,57 @@ async def index_memory(request: web.Request) -> web.Response:
 
 
 async def memory_stats(request: web.Request) -> web.Response:
-    """GET /api/memory/stats — Get search engine statistics."""
+    """GET /api/memory/stats — facts count + KG node/edge counts plus semantic search stats."""
+    import asyncio as _asyncio
+    import sqlite3
     try:
+        # Count facts/KG nodes/edges from SQLite memory DBs
+        def _count() -> dict:
+            facts = 0
+            kg_nodes = 0
+            kg_edges = 0
+            mem_dir = Path.home() / ".cato" / "memory"
+            if mem_dir.exists():
+                for db_path in mem_dir.glob("*.db"):
+                    try:
+                        conn = sqlite3.connect(str(db_path))
+                        for tbl in ("facts", "kg_nodes", "kg_edges"):
+                            try:
+                                n = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                                if tbl == "facts":
+                                    facts += n
+                                elif tbl == "kg_nodes":
+                                    kg_nodes += n
+                                elif tbl == "kg_edges":
+                                    kg_edges += n
+                            except Exception:
+                                pass
+                        conn.close()
+                    except Exception:
+                        pass
+            return {"facts": facts, "kg_nodes": kg_nodes, "kg_edges": kg_edges}
+
+        loop = _asyncio.get_running_loop()
+        db_stats = await loop.run_in_executor(None, _count)
+
         engine = _get_search_engine(initialize=False)
+        semantic_stats: dict = {"chunks_indexed": 0, "model": "all-MiniLM-L6-v2"}
+        if engine is not None:
+            semantic_stats = engine.stats()
+
         return web.json_response({
             "success": True,
-            "stats": engine.stats() if engine is not None else {
-                "chunks_indexed": 0,
-                "model": "all-MiniLM-L6-v2",
-            },
+            **db_stats,
+            "stats": semantic_stats,
         })
     except Exception as e:
         logger.exception(f"Error getting stats: {e}")
         return web.json_response({
             "success": False,
+            "facts": 0,
+            "kg_nodes": 0,
+            "kg_edges": 0,
+            "stats": {"chunks_indexed": 0, "model": "all-MiniLM-L6-v2"},
             "error": str(e)
         }, status=500)
 

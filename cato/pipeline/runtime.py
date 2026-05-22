@@ -311,6 +311,26 @@ class EmpireRuntime:
             }
 
         script_path = Path(script)
+
+        # SECURITY: Validate script path is within trusted directories.
+        # Scripts must be relative paths within the business directory or the
+        # built-in pipeline/scripts directory co-located with this file.
+        trusted_roots = [
+            run.business_dir.resolve(),
+            (Path(__file__).parent / "scripts").resolve(),
+        ]
+        if not script_path.is_absolute():
+            resolved_script = (run.business_dir / script_path).resolve()
+        else:
+            resolved_script = script_path.resolve()
+        resolved_str = str(resolved_script)
+        if not any(resolved_script.is_relative_to(root) for root in trusted_roots):
+            raise ValueError(
+                f"Script path '{resolved_script}' is outside trusted directories. "
+                f"Scripts must be relative to business_dir or pipeline/scripts/."
+            )
+        script_path = resolved_script
+
         argv: list[str]
         if script_path.suffix.lower() == ".py":
             argv = [sys.executable, str(script_path), *requirement.args]

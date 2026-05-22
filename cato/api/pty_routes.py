@@ -184,12 +184,16 @@ async def pty_websocket_handler(request: web.Request) -> web.StreamResponse:
                  or request.rel_url.query.get("token", ""))
         if not token:
             try:
-                first_msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+                # 2-second hard deadline — unauthenticated connections close immediately
+                first_msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
                 if first_msg.type == WSMsgType.TEXT:
                     parsed = json.loads(first_msg.data)
                     if parsed.get("type") == "auth":
                         token = str(parsed.get("token") or "")
-            except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+            except asyncio.TimeoutError:
+                await ws.close(code=4001, message=b"Auth timeout")
+                return ws
+            except (json.JSONDecodeError, Exception):
                 pass
         if not secrets.compare_digest(token, daemon_token):
             await ws.close(code=4401, message=b"Unauthorized")

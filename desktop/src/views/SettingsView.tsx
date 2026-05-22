@@ -67,6 +67,7 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
   const [defaultModel, setDefaultModel] = useState('')
   const [strictApproval, setStrictApproval] = useState(false)
   const [autoApprovedToolsText, setAutoApprovedToolsText] = useState('')
+  const [heartbeatInterval, setHeartbeatInterval] = useState(30)
 
   const alwaysGatedTools = [
     'shell.exec',
@@ -230,6 +231,29 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
         setSuccess('Approval policy saved')
       } else {
         setError('Failed to save approval policy')
+      }
+    } catch (err) {
+      setError(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSaveSchedule = async () => {
+    setLoading(true)
+    setError(null)
+
+    try {
+      const res = await fetch(`${base}/api/config`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ heartbeat_interval: heartbeatInterval }),
+      })
+
+      if (res.ok) {
+        setSuccess('Schedule saved')
+      } else {
+        setError('Failed to save schedule')
       }
     } catch (err) {
       setError(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`)
@@ -434,9 +458,14 @@ export function SettingsView({ httpPort }: SettingsViewProps) {
               </p>
               <div className="setting-group">
                 <label>Heartbeat Interval (minutes)</label>
-                <input type="number" placeholder="30" defaultValue="30" />
+                <input
+                  type="number"
+                  value={heartbeatInterval}
+                  onChange={e => setHeartbeatInterval(Number(e.target.value))}
+                  min={1}
+                />
               </div>
-              <button className="button-primary">Save Schedule</button>
+              <button onClick={handleSaveSchedule} className="button-primary">Save Schedule</button>
             </div>
           )}
 

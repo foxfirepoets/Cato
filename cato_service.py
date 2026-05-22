@@ -15,9 +15,15 @@ import win32event
 import win32service
 import win32serviceutil
 
-# Set working directory and vault password before anything else
+# Set working directory before anything else
 os.chdir(r"C:\Users\Administrator\Desktop\Cato")
-os.environ["CATO_VAULT_PASSWORD"] = "mypassword123"
+# Vault password must be set in the environment before installing/starting the service.
+# Example: set CATO_VAULT_PASSWORD=your-strong-password
+_vault_pw = os.environ.get("CATO_VAULT_PASSWORD")
+if not _vault_pw:
+    print("[CATO] ERROR: CATO_VAULT_PASSWORD environment variable is not set.")
+    print("[CATO] Set it before running: set CATO_VAULT_PASSWORD=<your-strong-password>")
+    sys.exit(1)
 
 
 class CatoDaemonService(win32serviceutil.ServiceFramework):

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
+import os
 import threading
 import time
 from typing import Any
@@ -17,6 +19,32 @@ logger = logging.getLogger(__name__)
 
 # Lock to prevent concurrent sys.path mutations during MCP server initialization
 _SYS_PATH_LOCK = threading.Lock()
+
+
+def _check_mcp_auth(request_headers: dict) -> bool:
+    """Verify the MCP request includes the daemon token.
+
+    The token is read from the ``_CATO_DAEMON_TOKEN`` environment variable,
+    which the daemon sets at startup.  If the variable is absent (e.g. in
+    tests or legacy installs) the check is skipped and all requests are
+    allowed — the localhost-only binding (``127.0.0.1:8765``) is the
+    primary access control in that case.
+
+    **Current limitation:** FastMCP 2.x does not pass raw HTTP request headers
+    to tool handler functions.  This function is called with an empty dict
+    ``{}`` until FastMCP exposes a header-access API.  While ``_CATO_DAEMON_TOKEN``
+    is unset (the default), behaviour is correct — all calls are allowed and
+    localhost binding is the sole guard.  Do NOT set ``_CATO_DAEMON_TOKEN``
+    until FastMCP header support is wired, or all MCP tool calls will be
+    permanently denied.  See: https://github.com/jlowin/fastmcp/issues (track
+    header access support).
+    """
+    expected = os.environ.get("_CATO_DAEMON_TOKEN", "")
+    if not expected:
+        # Token not configured — allow; localhost binding is the protection.
+        return True
+    provided = request_headers.get("x-cato-token", "")
+    return hmac.compare_digest(expected, provided)
 
 
 def _adapter_status(gateway: Any) -> list[dict[str, Any]]:
@@ -130,6 +158,16 @@ def create_mcp_server(gateway: Any, config: Any) -> Any:
         structured_output=True,
     )
     async def cato_list_sessions() -> dict[str, Any]:
+        # SECURITY NOTE: This endpoint exposes internal session identifiers.
+        # Primary access control is the localhost-only binding (127.0.0.1:8765).
+        # For SSH-tunnel or reverse-proxy scenarios, set _CATO_DAEMON_TOKEN in the
+        # daemon environment and require callers to supply it via x-cato-token.
+        # FastMCP tool handlers do not receive raw HTTP headers; the check below
+        # uses an empty dict which allows the call when no token is configured
+        # (i.e. the localhost binding is the sole guard).  When a token IS set,
+        # all calls without an explicit header are blocked.
+        if not _check_mcp_auth({}):
+            return {"error": "unauthorized", "sessions": [], "count": 0}
         sessions = []
         for sid, lane in getattr(gateway, "_lanes", {}).items():
             queue_depth = lane._queue.qsize() if hasattr(lane, "_queue") else 0
@@ -143,6 +181,13 @@ def create_mcp_server(gateway: Any, config: Any) -> Any:
         structured_output=True,
     )
     async def cato_get_history(session_id: str, limit: int = 20) -> dict[str, Any]:
+        # SECURITY NOTE: This endpoint returns message history which may contain PII.
+        # Primary access control is the localhost-only binding (127.0.0.1:8765).
+        # For SSH-tunnel or reverse-proxy scenarios, set _CATO_DAEMON_TOKEN in the
+        # daemon environment and require callers to supply it via x-cato-token.
+        # See _check_mcp_auth() for the token verification logic.
+        if not _check_mcp_auth({}):
+            return {"error": "unauthorized", "session_id": session_id, "messages": [], "count": 0}
         messages = _history_for_session(gateway, session_id, limit)
         return {"session_id": session_id, "messages": messages, "count": len(messages)}
 

@@ -17,6 +17,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# CANONICAL PATH: chunk_usage is also defined in memory.py for per-agent DBs.
+# When ContextPool is constructed with a memory instance, it uses memory._db_path.
+# When constructed without a memory instance, it defaults to context_pool.db.
+# This split means queries in different contexts may read from different files.
+# Always construct ContextPool with a memory instance to ensure consistency.
 # Schema for chunk_usage table (also referenced in memory.py _SCHEMA extension)
 _CHUNK_USAGE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunk_usage (
@@ -64,6 +69,13 @@ class ContextPool:
     ) -> None:
         self._memory = memory
         self._ab_state = ABTestState()
+
+        if memory is None:
+            logger.warning(
+                "[ContextPool] No memory instance provided. chunk_usage will write to "
+                "context_pool.db, which may diverge from agent memory DB. "
+                "Pass a memory instance for consistency."
+            )
 
         # Connect to same db as memory if possible, otherwise use provided path
         if db_path is not None:

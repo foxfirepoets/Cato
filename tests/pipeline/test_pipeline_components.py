@@ -442,7 +442,10 @@ class TestTelegramBridge:
     def test_launch_bridge_has_correct_token(self):
         launch = Path(r"C:\Users\Administrator\Desktop\Cato\launch_bridge.py")
         content = launch.read_text(encoding="utf-8")
-        assert "8573304576" in content, "launch_bridge.py does not contain the claudeoneshot_bot token"
+        # Token must NOT be hardcoded — it is read from CATODESKTOP_BOT_TOKEN / TELEGRAM_BOT_TOKEN env var
+        assert "8573304576" not in content, "launch_bridge.py must not hardcode the bot token — use CATODESKTOP_BOT_TOKEN env var"
+        assert "CATODESKTOP_BOT_TOKEN" in content or "TELEGRAM_BOT_TOKEN" in content, \
+            "launch_bridge.py must read token from CATODESKTOP_BOT_TOKEN or TELEGRAM_BOT_TOKEN env var"
         # Must NOT contain old Cato bot token
         assert "8622193070" not in content, "launch_bridge.py still has old Cato bot token!"
 

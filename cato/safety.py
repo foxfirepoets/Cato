@@ -58,6 +58,9 @@ _TOOL_TIER: dict[str, RiskTier] = {
 _IRREVERSIBLE_SHELL_KEYWORDS = frozenset({
     "rm", "del", "delete", "drop", "format", "truncate", "rmdir",
     "remove", "unlink", "shred", "wipe",
+    # PowerShell destructive verbs and their common aliases
+    "remove-item", "clear-content", "format-volume", "stop-process",
+    "invoke-expression", "iex",
 })
 
 _HIGH_STAKES_SHELL_KEYWORDS = frozenset({

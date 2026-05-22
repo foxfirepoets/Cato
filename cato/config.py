@@ -151,6 +151,9 @@ class CatoConfig:
 
     # Safety gates
     safety_mode: str = "strict"             # strict | permissive | off
+    # When False (default) PowerShell commands run in gateway/sandbox mode.
+    # Set True only to explicitly grant unrestricted full-shell access.
+    powershell_full_mode: bool = False
 
     # Tool-approval policy (per-call user-confirmation gate)
     #
@@ -326,9 +329,9 @@ class CatoConfig:
         return out
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialise config to a plain dict (excluding private fields)."""
+        """Serialise config to a plain dict (excluding private and runtime-only fields)."""
         return {
             f.name: getattr(self, f.name)
             for f in fields(self)
-            if not f.name.startswith("_")
+            if not f.name.startswith("_") and f.name not in self._RUNTIME_ONLY
         }

@@ -4,7 +4,7 @@
 - Backend tests: `cd C:/Users/Administrator/Desktop/Cato && python -m pytest tests/ -x --tb=short`
 - Frontend build: `cd C:/Users/Administrator/Desktop/Cato/desktop && npm run build`
 - Frontend dev: `cd C:/Users/Administrator/Desktop/Cato/desktop && npm run dev`
-- Daemon: `cd C:/Users/Administrator/Desktop/Cato && CATO_VAULT_PASSWORD=mypassword123 python cato_svc_runner.py`
+- Daemon: `cd C:/Users/Administrator/Desktop/Cato && CATO_VAULT_PASSWORD=<your-vault-password> python cato_svc_runner.py`
 
 ## Validation Commands
 ```bash

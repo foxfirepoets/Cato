@@ -31,8 +31,6 @@ _DEFAULT_ALLOWED_TOOLS = frozenset({
     "conduit_navigate", "conduit_extract", "conduit_click", "conduit_type",
     "conduit.crawl", "conduit.monitor",
     "browser",
-    # Code execution (sandboxed)
-    "python.execute", "shell_execute", "shell.exec", "shell",
     # GitHub (read + write)
     "github.issue_list", "github.pr_list",
     "github.pr_review", "github.issue_create",

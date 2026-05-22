@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS emails (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_emails_status ON emails(status);
+
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content TEXT NOT NULL,

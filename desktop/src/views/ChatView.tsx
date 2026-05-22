@@ -164,6 +164,8 @@ export const ChatView: React.FC<ChatViewProps> = ({ wsBase, httpPort, daemonToke
   const [input, setInput] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<UploadedFile[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const isConnected = connectionStatus === "connected";
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -199,10 +201,10 @@ export const ChatView: React.FC<ChatViewProps> = ({ wsBase, httpPort, daemonToke
           type: data.type,
         }]);
       } else {
-        alert(`Upload failed: ${data.error || "unknown error"}`);
+        setErrorMsg(`Upload failed: ${data.error || "unknown error"}`);
       }
     } catch (e) {
-      alert(`Upload failed: ${e}`);
+      setErrorMsg(`Upload failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setUploading(false);
     }
@@ -284,6 +286,27 @@ export const ChatView: React.FC<ChatViewProps> = ({ wsBase, httpPort, daemonToke
           <span style={{ fontSize: 16, color: "var(--accent-primary, #6366f1)", fontWeight: 600 }}>
             Drop files here to attach
           </span>
+        </div>
+      )}
+
+      {errorMsg && (
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "8px 16px", background: "rgba(239, 68, 68, 0.12)",
+          borderBottom: "1px solid rgba(239, 68, 68, 0.3)",
+          color: "#f87171", fontSize: 13,
+        }}>
+          <span>{errorMsg}</span>
+          <button
+            onClick={() => setErrorMsg(null)}
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              color: "#f87171", fontSize: 16, lineHeight: 1, padding: "0 4px",
+            }}
+            aria-label="Dismiss error"
+          >
+            ×
+          </button>
         </div>
       )}
 
@@ -381,7 +404,7 @@ export const ChatView: React.FC<ChatViewProps> = ({ wsBase, httpPort, daemonToke
           type="button"
           className="chat-upload-btn"
           onClick={() => fileInputRef.current?.click()}
-          disabled={uploading || connectionStatus !== "connected"}
+          disabled={uploading || !isConnected}
           title="Attach a file"
           style={{
             display: "flex", alignItems: "center", justifyContent: "center",
@@ -411,13 +434,13 @@ export const ChatView: React.FC<ChatViewProps> = ({ wsBase, httpPort, daemonToke
             : "Type a message... (Enter to send, Shift+Enter for newline)"}
           aria-label="Type a message"
           rows={2}
-          disabled={connectionStatus !== "connected"}
-          autoFocus
+          disabled={!isConnected}
+          autoFocus={isConnected}
         />
         <button
           type="submit"
           className="chat-send-btn"
-          disabled={(!input.trim() && attachedFiles.length === 0) || connectionStatus !== "connected" || isStreaming}
+          disabled={(!input.trim() && attachedFiles.length === 0) || !isConnected || isStreaming}
         >
           {isStreaming ? "Working..." : "Send"}
         </button>

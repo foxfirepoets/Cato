@@ -79,6 +79,14 @@ class TelegramAdapter(BaseAdapter):
 
     async def start(self) -> None:
         """Initialise the bot and begin long-polling."""
+        # Ensure personal_store schema exists before any handler can call it.
+        # init_db is idempotent (CREATE TABLE IF NOT EXISTS) and sync.
+        try:
+            from cato.core import personal_store  # noqa: PLC0415
+            personal_store.init_db()
+        except Exception as exc:
+            logger.error("Failed to initialise personal_store schema: %s", exc)
+
         self._bot_token = (
             self.vault.get("TELEGRAM_BOT_TOKEN")
             or self.vault.get("CATODESKTOP_BOT_TOKEN")

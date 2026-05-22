@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS routing_events (
     tool_call_count INTEGER NOT NULL,
     error TEXT NOT NULL,
     metadata_json TEXT NOT NULL
-)
+);
+CREATE INDEX IF NOT EXISTS idx_routing_ts ON routing_events(ts);
 """
 
 _COLUMNS: dict[str, str] = {
@@ -59,7 +60,8 @@ def _connect() -> sqlite3.Connection:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(_DB_PATH), timeout=5, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute(_SCHEMA)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(_SCHEMA)
     _ensure_columns(conn)
     conn.commit()
     return conn

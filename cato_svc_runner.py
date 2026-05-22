@@ -12,8 +12,14 @@ _DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "cato"
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 _DAEMON_LOG = _DATA_DIR / "daemon_runner.log"
 
-# Vault password — baked in so no env var needed when run as SYSTEM
-os.environ.setdefault("CATO_VAULT_PASSWORD", "mypassword123")
+# Vault password must be set in the environment before running this script.
+# Example: set CATO_VAULT_PASSWORD=your-strong-password (Windows CMD)
+#          $env:CATO_VAULT_PASSWORD = "your-strong-password" (PowerShell)
+_vault_pw = os.environ.get("CATO_VAULT_PASSWORD")
+if not _vault_pw:
+    print("[CATO] ERROR: CATO_VAULT_PASSWORD environment variable is not set.")
+    print("[CATO] Set it before running: set CATO_VAULT_PASSWORD=<your-strong-password>")
+    sys.exit(1)
 
 # Hidden/background launches on Windows can have no real stdout/stderr.
 if sys.stdout is None:

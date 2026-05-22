@@ -33,14 +33,10 @@ Cato stores all credentials in AES-256-GCM encrypted vault (`vault.enc`), emits 
 ### Install
 
 ```bash
-# From PyPI (recommended)
-pip install cato-daemon
-patchright install chromium   # one-time browser download (~130 MB)
-
-# Or install from source
 git clone https://github.com/bkauto3/cato
-cd cato && pip install -e .
-patchright install chromium
+cd Cato
+pip install -e .
+patchright install chromium   # one-time browser download (~130 MB)
 ```
 
 ### First run (~60 seconds)
@@ -120,6 +116,8 @@ swarmsync_api_url: https://api.swarmsync.ai/v1/chat/completions
 ```
 
 Or enable interactively during `cato init`.
+
+> **Note:** When `swarmsync_enabled: true`, message content is routed through the SwarmSync API.
 
 ### How it works
 

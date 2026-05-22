@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 from urllib.parse import quote_plus
 
+from cato.integrations.http_client import _assert_safe_url
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -247,6 +249,7 @@ class WebSearchTool:
             return []
 
         url = f"https://api.duckduckgo.com/?q={quote_plus(query)}&format=json&no_html=1&skip_disambig=1"
+        _assert_safe_url(url)  # raises ValueError on private/metadata IPs
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 429:
@@ -303,6 +306,7 @@ class WebSearchTool:
             "Accept-Encoding": "gzip",
             "X-Subscription-Token": api_key,
         }
+        _assert_safe_url(url)  # raises ValueError on private/metadata IPs
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 429:
@@ -341,7 +345,7 @@ class WebSearchTool:
         url = "https://api.exa.ai/search"
         payload = {"query": query, "numResults": 10, "useAutoprompt": True}
         headers = {"x-api-key": api_key, "Content-Type": "application/json"}
-
+        _assert_safe_url(url)  # raises ValueError on private/metadata IPs
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
@@ -387,6 +391,7 @@ class WebSearchTool:
             "max_results": 10,
             "include_answer": False,
         }
+        _assert_safe_url(url)  # raises ValueError on private/metadata IPs
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 429:
@@ -421,6 +426,7 @@ class WebSearchTool:
             f"https://export.arxiv.org/api/query"
             f"?search_query=all:{quote_plus(query)}&start=0&max_results=10"
         )
+        _assert_safe_url(url)  # raises ValueError on private/metadata IPs
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 429:
@@ -475,6 +481,7 @@ class WebSearchTool:
             f"https://api.semanticscholar.org/graph/v1/paper/search"
             f"?query={quote_plus(query)}&limit=10&fields=title,abstract,externalIds,year,url"
         )
+        _assert_safe_url(url)  # raises ValueError on private/metadata IPs
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
@@ -519,6 +526,7 @@ class WebSearchTool:
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
                 f"?db=pubmed&term={quote_plus(query)}&retmax=10&retmode=json&usehistory=y"
             )
+            _assert_safe_url(esearch_url)  # raises ValueError on private/metadata IPs
             async with aiohttp.ClientSession() as session:
                 async with session.get(esearch_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
@@ -536,6 +544,7 @@ class WebSearchTool:
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
                 f"?db=pubmed&id={','.join(pmids)}&retmode=json"
             )
+            _assert_safe_url(efetch_url)  # raises ValueError on private/metadata IPs
             async with aiohttp.ClientSession() as session:
                 async with session.get(efetch_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
@@ -578,6 +587,7 @@ class WebSearchTool:
             return []
 
         url = f"{instance_url.rstrip('/')}/search?q={quote_plus(query)}&format=json"
+        _assert_safe_url(url)  # raises ValueError on private/metadata IPs (especially for user-supplied instance_url)
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 429:
@@ -623,6 +633,7 @@ class WebSearchTool:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        _assert_safe_url(url)  # raises ValueError on private/metadata IPs
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)

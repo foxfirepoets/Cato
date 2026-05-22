@@ -56,7 +56,7 @@ CODE COMPLETE
 - Config: `%APPDATA%\cato\config.yaml`
 - Default model: `openrouter/minimax/minimax-m2.5`
 - **workspace_dir**: defaults to `%APPDATA%\cato\workspace` on Windows, `~/.cato/workspace` on macOS/Linux (critical for identity files)
-- **swarmsync_enabled: true** — SwarmSync routing is enabled; routes calls to the best model based on complexity
+- **swarmsync_enabled: true** — routes LLM calls through SwarmSync when `SWARMSYNC_API_KEY` is set and `swarmsync_enabled: true`; if the key is missing, Cato returns a user-visible error rather than silently failing
 - Vault: `%APPDATA%\cato\vault.enc` — stores `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `SWARMSYNC_API_KEY`
 - Vault password: `CATO_VAULT_PASSWORD=mypassword123` (**example only — always choose a unique, strong password in real installs**)
 - Run daemon: `CATO_VAULT_PASSWORD=<your-strong-password> python cato_svc_runner.py`
@@ -107,7 +107,7 @@ desktop/               Tauri v2 desktop app
       SettingsView.tsx Settings tabs (general/memory/channels/scheduling/workspace)
   src-tauri/           Rust sidecar
     target/release/    cato-desktop.exe (17MB release build)
-tests/                 pytest test suite (1346+ tests, must stay 100%)
+tests/                 pytest test suite (1869+ tests)
 ```
 
 ## DESKTOP APP DETAILS
@@ -126,7 +126,7 @@ tests/                 pytest test suite (1346+ tests, must stay 100%)
 
 - Skills directory: `~/.cato/skills/` (18+ skills: add-notion, coding-agent, daily-digest, etc.)
 - System prompt injection: `agent_loop.py` builds prompt with `skills_dir` parameter
-- SwarmSync routing is enabled (`swarmsync_enabled: true`) — routes each call to the best model
+- SwarmSync routing is active when `SWARMSYNC_API_KEY` is set and `swarmsync_enabled: true` — routes each call to the best model
 - Workspace files (`SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `TOOLS.md`) loaded from `workspace_dir`
 
 ## CODING AGENT STATUS
@@ -149,7 +149,7 @@ Fan-out to Claude/Codex/Gemini/Cursor in parallel (60s timeout each):
 
 - pytest asyncio_mode=auto, tests/ directory
 - Coverage via pytest-cov; `norecursedirs` excludes `.claude`, `BRAINSTORM`, `venv`
-- **1705/1705 tests passing** as of 2026-05-13
+- **1869 passed, 2 failed** as of 2026-05-22 (1 collection error in `tests/test_conduit_proof.py`; 4 skipped)
 
 ## AUDIT REPORT LOCATIONS
 
